@@ -9,6 +9,13 @@ import (
 	"testing"
 )
 
+func TestEndpointdDefaultSocketMatchesDaemon(t *testing.T) {
+	t.Setenv("CMXSAFE_ENDPOINTD_SOCK", "")
+	if got, want := endpointdSocketPath(), "/run/cmxsafe/endpointd.sock"; got != want {
+		t.Fatalf("endpointd socket = %q, want %q", got, want)
+	}
+}
+
 func TestValidateMirrorPeer(t *testing.T) {
 	for _, tc := range []struct {
 		ip   string

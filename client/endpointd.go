@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const defaultEndpointdSocket = "/var/run/cmxsafe-endpointd.sock"
+const defaultEndpointdSocket = "/run/cmxsafe/endpointd.sock"
 
 type endpointdReply struct {
 	OK    bool   `json:"ok"`

@@ -40,7 +40,7 @@ Runtime dependencies:
   The client was derived from Younes Douici's original
   [`ssh3-uid-helper`](https://github.com/YounesD75/ssh3-uid-helper) work, with
   permission from the rights holder, and carries Apache-2.0 attribution.
-- `cmxsafe-endpointd` v1 at `/var/run/cmxsafe-endpointd.sock`, overridable with
+- `cmxsafe-endpointd` v1 at `/run/cmxsafe/endpointd.sock`, overridable with
   `CMXSAFE_ENDPOINTD_SOCK`. Requests are `v1 ensure/release peer <lease_id>`,
   where `lease_id` is the SSH3 channel ID. Endpointd binds that lease to the
   Unix `SO_PEERCRED` identity (PID and process start time), never to caller-
