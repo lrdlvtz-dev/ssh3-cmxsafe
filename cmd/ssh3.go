@@ -96,11 +96,11 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 
 	var qconf quic.Config
 
-        qconf.MaxIncomingUniStreams = 10000
-        qconf.MaxIncomingStreams = 10000
-        qconf.Allow0RTT = false
-        qconf.EnableDatagrams = true
-        qconf.KeepAlivePeriod = 1 * time.Second
+	qconf.MaxIncomingUniStreams = 10000
+	qconf.MaxIncomingStreams = 10000
+	qconf.Allow0RTT = false
+	qconf.EnableDatagrams = true
+	qconf.KeepAlivePeriod = 1 * time.Second
 
 	if certs, ok := knownHosts[options.CanonicalHostFormat()]; ok {
 		foundSelfsignedSSH3 := false
@@ -246,7 +246,9 @@ func parseAddrPort(addrPort string) (localIP net.IP, localPort int, remoteIP net
 
 // stringList is a flag.Value that collects every -flag occurrence into a
 // slice, so users can pass e.g.
-//   -forward-tcp A1 -forward-tcp A2
+//
+//	-forward-tcp A1 -forward-tcp A2
+//
 // instead of being limited to a single -forward-tcp value.
 type stringList []string
 
@@ -626,7 +628,6 @@ func ClientMain() int {
 		return -1
 	}
 
-
 	var sshConfig *ssh_config.Config
 	var configBytes []byte
 	configPath := path.Join(homedir(), ".ssh", "config")
@@ -875,7 +876,6 @@ func ClientMain() int {
 			return -1
 		}
 	}
-
 
 	err = c.RunSession(tty, *forwardSSHAgent, command...)
 	switch sessionError := err.(type) {

@@ -18,6 +18,15 @@
 
 ## CMXsafe Identity and Mirror Sockets
 
+### Platform scope
+
+The CMXsafe integration in this fork is **Linux-only**. It depends on Linux
+Unix-socket credential and descriptor-passing APIs (`SO_PEERCRED`,
+`SCM_RIGHTS`), UID-owned sockets and the Linux endpoint address manager.
+macOS, Windows and BSD builds from upstream SSH3 are not supported by this
+branch. The inherited portability workflows remain available for manual
+upstream comparison, but do not run automatically on pull requests.
+
 For a direct TCP/UDP forward, the SSH3 client sends a CMXsafe-v1 header carrying
 only the source port it observed at ingress. It never supplies a source IP. The
 gateway derives the canonical IPv6 identity from the authenticated Unix UID and
@@ -58,6 +67,12 @@ go test ./...
 go test -race ./...
 go build ./cmd/ssh3 ./cmd/ssh3-server
 ```
+
+The automatic `CMXsafe Linux` GitHub Actions workflow runs those checks on
+Ubuntu 22.04 for pushes, pull requests and manual dispatch. Kernel-level E2E
+tests additionally require compatible `ssh3-uid-helper` v2 and
+`cmxsafe-endpointd` v1 daemons and are therefore run in the privileged CMXsafe
+test environment rather than on an unconfigured hosted runner.
 SSH3 is a complete revisit of the SSH
 protocol, mapping its semantics on top of the HTTP mechanisms. It comes from our research work and we (researchers) recently proposed it as an [Internet-Draft](https://www.ietf.org/how/ids/) ([draft-michel-remote-terminal-http3-00](https://datatracker.ietf.org/doc/draft-michel-remote-terminal-http3/)).
 

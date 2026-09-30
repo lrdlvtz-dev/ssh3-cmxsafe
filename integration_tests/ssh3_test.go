@@ -650,12 +650,12 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			})
 
 			// It checks the client with the -forward-udp or -reverse-udp forwarding options.
- 			// As forward-tcp, a TCP socket is indeed well open on the client and is forwarded
- 			// through the SSH3 connection towards the specified remote IP and port at server´s reach.
- 			// When reverse-tcp is specified, a UDP socket is open on the server and forwarded through
- 			// the SSH3 connection towards the specified remote IP and port at client's reach.
- 			// As the server and the client are run on the same machine the same test can be reused
- 			// for both cases.
+			// As forward-tcp, a TCP socket is indeed well open on the client and is forwarded
+			// through the SSH3 connection towards the specified remote IP and port at server´s reach.
+			// When reverse-tcp is specified, a UDP socket is open on the server and forwarded through
+			// the SSH3 connection towards the specified remote IP and port at client's reach.
+			// As the server and the client are run on the same machine the same test can be reused
+			// for both cases.
 			Context("UDP port forwarding", func() {
 				testUDPPortForwarding := func(localPort uint16, proxyJump bool, remoteAddr *net.UDPAddr, messageFromClient, messageFromServer string, forwardingType string) {
 					localIPBare := "::1"
