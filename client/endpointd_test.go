@@ -45,15 +45,22 @@ func TestEndpointdVersionedEnsureReleaseWithoutCallerOwner(t *testing.T) {
 		}
 	}()
 	ip := net.ParseIP("2001:db8::42")
-	if err := endpointdPeer("ensure", ip); err != nil {
+	if err := endpointdPeer("ensure", 42, ip); err != nil {
 		t.Fatal(err)
 	}
-	if err := endpointdPeer("release", ip); err != nil {
+	if err := endpointdPeer("release", 42, ip); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"v1\tensure\tpeer\t2001:db8::42\n", "v1\trelease\tpeer\t2001:db8::42\n"} {
+	for _, want := range []string{"v1\tensure\tpeer\t42\t2001:db8::42\n", "v1\trelease\tpeer\t42\t2001:db8::42\n"} {
 		if got := <-requests; got != want || strings.Contains(got, "pid:") {
 			t.Fatalf("request %q, want %q", got, want)
 		}
+	}
+}
+
+func TestEndpointdRejectsZeroLeaseIDBeforeDial(t *testing.T) {
+	t.Setenv("CMXSAFE_ENDPOINTD_SOCK", filepath.Join(t.TempDir(), "absent.sock"))
+	if err := endpointdPeer("ensure", 0, net.ParseIP("2001:db8::42")); err == nil || !strings.Contains(err.Error(), "lease id") {
+		t.Fatalf("zero lease id error = %v", err)
 	}
 }

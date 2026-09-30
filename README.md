@@ -41,9 +41,10 @@ Runtime dependencies:
   [`ssh3-uid-helper`](https://github.com/YounesD75/ssh3-uid-helper) work, with
   permission from the rights holder, and carries Apache-2.0 attribution.
 - `cmxsafe-endpointd` v1 at `/var/run/cmxsafe-endpointd.sock`, overridable with
-  `CMXSAFE_ENDPOINTD_SOCK`. Requests are `v1 ensure/release peer`; endpointd
-  derives lease ownership from Unix `SO_PEERCRED` (PID and process start time),
-  never from caller-provided ownership text.
+  `CMXSAFE_ENDPOINTD_SOCK`. Requests are `v1 ensure/release peer <lease_id>`,
+  where `lease_id` is the SSH3 channel ID. Endpointd binds that lease to the
+  Unix `SO_PEERCRED` identity (PID and process start time), never to caller-
+  provided process ownership text.
 
 The gateway and endpoint must have the canonical IPv6 addresses configured as
 specified by CMXsafe. IPv4, loopback, multicast, link-local, zero/privileged

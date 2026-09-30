@@ -44,9 +44,12 @@ func validateMirrorPeer(ip net.IP, port int) error {
 // ssh3Channel is kept tiny so endpointd protocol tests need no QUIC stream.
 type ssh3Channel interface{ ChannelID() uint64 }
 
-func endpointdPeer(op string, ip net.IP) error {
+func endpointdPeer(op string, leaseID uint64, ip net.IP) error {
 	if op != "ensure" && op != "release" {
 		return fmt.Errorf("invalid endpointd operation %q", op)
+	}
+	if leaseID == 0 {
+		return errors.New("endpointd lease id must be a non-zero channel id")
 	}
 	if err := validateMirrorPeer(ip, 1024); err != nil {
 		return err
@@ -57,9 +60,10 @@ func endpointdPeer(op string, ip net.IP) error {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	// endpointd v1 derives its owner from SO_PEERCRED (PID plus process start
-	// marker).  No caller-supplied ownership token crosses this boundary.
-	if _, err := fmt.Fprintf(conn, "v1\t%s\tpeer\t%s\n", op, ip.To16().String()); err != nil {
+	// endpointd v1 binds this opaque per-channel lease ID to the caller identity
+	// derived from SO_PEERCRED (PID plus process start marker).  No caller-
+	// supplied process ownership token crosses this boundary.
+	if _, err := fmt.Fprintf(conn, "v1\t%s\tpeer\t%d\t%s\n", op, leaseID, ip.To16().String()); err != nil {
 		return fmt.Errorf("write endpointd request: %w", err)
 	}
 	line, err := bufio.NewReader(io.LimitReader(conn, 4096)).ReadBytes('\n')
@@ -86,10 +90,11 @@ func dialMirrorTCP(channel ssh3Channel, peer, target *net.TCPAddr) (*net.TCPConn
 	if err := validateMirrorPeer(peer.IP, peer.Port); err != nil {
 		return nil, nil, err
 	}
-	if err := endpointdPeer("ensure", peer.IP); err != nil {
+	leaseID := channel.ChannelID()
+	if err := endpointdPeer("ensure", leaseID, peer.IP); err != nil {
 		return nil, nil, err
 	}
-	release := func() { _ = endpointdPeer("release", peer.IP) }
+	release := func() { _ = endpointdPeer("release", leaseID, peer.IP) }
 	conn, err := net.DialTCP("tcp6", peer, target)
 	if err != nil {
 		release()
@@ -105,10 +110,11 @@ func dialMirrorUDP(channel ssh3Channel, peer, target *net.UDPAddr) (*net.UDPConn
 	if err := validateMirrorPeer(peer.IP, peer.Port); err != nil {
 		return nil, nil, err
 	}
-	if err := endpointdPeer("ensure", peer.IP); err != nil {
+	leaseID := channel.ChannelID()
+	if err := endpointdPeer("ensure", leaseID, peer.IP); err != nil {
 		return nil, nil, err
 	}
-	release := func() { _ = endpointdPeer("release", peer.IP) }
+	release := func() { _ = endpointdPeer("release", leaseID, peer.IP) }
 	conn, err := net.DialUDP("udp6", peer, target)
 	if err != nil {
 		release()
