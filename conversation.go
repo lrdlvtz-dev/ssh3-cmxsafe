@@ -118,22 +118,24 @@ func (c *Conversation) EstablishClientConversation(req *http.Request, roundTripp
 		// forward channels; surface it instead of silently demoting
 		// the channel to a generic one.
 		switch channelInfo.ChannelType {
-		case "open-request-reverse-tcp":
-			bind, err := parseTCPForwardingHeader(channelInfo.ChannelID, &StreamByteReader{stream})
+		case "cmxsafe-open-reverse-tcp-v1":
+			bindIP, bindPort, peerIP, peerPort, err := parseCMXsafeReverseOpenHeader(channelInfo.ChannelID, &StreamByteReader{stream})
 			if err != nil {
-				log.Error().Msgf("parse open-request-reverse-tcp header: %s", err)
+				log.Error().Msgf("parse CMXsafe reverse TCP header: %s", err)
 				return false, err
 			}
-			c.channelsAcceptQueue.Add(&TCPOpenReverseForwardingChannelImpl{Channel: newChannel, BindAddr: bind})
+			c.channelsAcceptQueue.Add(&TCPOpenReverseForwardingChannelImpl{Channel: newChannel, BindAddr: &net.TCPAddr{IP: bindIP, Port: int(bindPort)}, PeerAddr: &net.TCPAddr{IP: peerIP, Port: int(peerPort)}})
 			return true, nil
-		case "open-request-reverse-udp":
-			bind, err := parseUDPForwardingHeader(channelInfo.ChannelID, &StreamByteReader{stream})
+		case "cmxsafe-open-reverse-udp-v1":
+			bindIP, bindPort, peerIP, peerPort, err := parseCMXsafeReverseOpenHeader(channelInfo.ChannelID, &StreamByteReader{stream})
 			if err != nil {
-				log.Error().Msgf("parse open-request-reverse-udp header: %s", err)
+				log.Error().Msgf("parse CMXsafe reverse UDP header: %s", err)
 				return false, err
 			}
-			c.channelsAcceptQueue.Add(&UDPOpenReverseForwardingChannelImpl{Channel: newChannel, BindAddr: bind})
+			c.channelsAcceptQueue.Add(&UDPOpenReverseForwardingChannelImpl{Channel: newChannel, BindAddr: &net.UDPAddr{IP: bindIP, Port: int(bindPort)}, PeerAddr: &net.UDPAddr{IP: peerIP, Port: int(peerPort)}})
 			return true, nil
+		case "open-request-reverse-tcp", "open-request-reverse-udp":
+			return false, fmt.Errorf("legacy reverse-open channel %q rejected: CMXsafe v1 peer tuple is required", channelInfo.ChannelType)
 		}
 
 		c.channelsAcceptQueue.Add(newChannel)
@@ -313,13 +315,16 @@ func (c *Conversation) OpenUDPForwardingChannel(maxPacketSize uint64, datagramsQ
 	if err != nil {
 		return nil, err
 	}
-	additionalBytes := buildForwardingChannelAdditionalBytes(remoteAddr.IP, uint16(remoteAddr.Port))
+	additionalBytes, err := buildCMXsafeDirectAdditionalBytes(uint16(localAddr.Port), remoteAddr.IP, uint16(remoteAddr.Port))
+	if err != nil {
+		return nil, err
+	}
 
-	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "direct-udp", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
+	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "cmxsafe-direct-udp-v1", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
 	channel.setDatagramSender(c.getDatagramSenderForChannel(channel.ChannelID()))
 	channel.maybeSendHeader()
 	c.channelsManager.addChannel(channel)
-	return &UDPForwardingChannelImpl{Channel: channel, RemoteAddr: remoteAddr}, nil
+	return &UDPForwardingChannelImpl{Channel: channel, RemoteAddr: remoteAddr, SourcePort: uint16(localAddr.Port)}, nil
 }
 
 func (c *Conversation) OpenTCPForwardingChannel(maxPacketSize uint64, datagramsQueueSize uint64, localAddr *net.TCPAddr, remoteAddr *net.TCPAddr) (Channel, error) {
@@ -328,12 +333,15 @@ func (c *Conversation) OpenTCPForwardingChannel(maxPacketSize uint64, datagramsQ
 	if err != nil {
 		return nil, err
 	}
-	additionalBytes := buildForwardingChannelAdditionalBytes(remoteAddr.IP, uint16(remoteAddr.Port))
+	additionalBytes, err := buildCMXsafeDirectAdditionalBytes(uint16(localAddr.Port), remoteAddr.IP, uint16(remoteAddr.Port))
+	if err != nil {
+		return nil, err
+	}
 
-	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "direct-tcp", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
+	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "cmxsafe-direct-tcp-v1", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
 	channel.maybeSendHeader()
 	c.channelsManager.addChannel(channel)
-	return &TCPForwardingChannelImpl{Channel: channel, RemoteAddr: remoteAddr}, nil
+	return &TCPForwardingChannelImpl{Channel: channel, RemoteAddr: remoteAddr, SourcePort: uint16(localAddr.Port)}, nil
 }
 func (c *Conversation) RequestTCPReverseChannel(maxPacketSize uint64, datagramsQueueSize uint64, localAddr *net.TCPAddr, remoteAddr *net.TCPAddr) (Channel, error) {
 	str, err := c.streamCreator.OpenStream()
@@ -363,6 +371,7 @@ func (c *Conversation) RequestUDPReverseChannel(maxPacketSize uint64, datagramsQ
 	return &UDPForwardingChannelImpl{Channel: channel, LocalAddr: localAddr, RemoteAddr: remoteAddr}, nil
 
 }
+
 // OpenTCPReverseForwardingChannel opens a server-initiated data channel
 // for one inbound connection on a previously-established reverse-TCP
 // forward.  bindAddr is the server-side listening address that produced
@@ -371,18 +380,21 @@ func (c *Conversation) RequestUDPReverseChannel(maxPacketSize uint64, datagramsQ
 // matching reverse-forward handler.  Without this, multiple concurrent
 // reverse-TCP forwards on the same conversation would be indistinguishable
 // to the client and would race over each other.
-func (c *Conversation) OpenTCPReverseForwardingChannel(maxPacketSize uint64, datagramsQueueSize uint64, bindAddr *net.TCPAddr) (Channel, error) {
+func (c *Conversation) OpenTCPReverseForwardingChannel(maxPacketSize uint64, datagramsQueueSize uint64, bindAddr, peerAddr *net.TCPAddr) (Channel, error) {
 
 	str, err := c.streamCreator.OpenStream()
 	if err != nil {
 		return nil, err
 	}
 
-	additionalBytes := buildForwardingChannelAdditionalBytes(bindAddr.IP, uint16(bindAddr.Port))
-	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "open-request-reverse-tcp", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
+	additionalBytes, err := buildCMXsafeReverseOpenAdditionalBytes(bindAddr.IP, uint16(bindAddr.Port), peerAddr.IP, uint16(peerAddr.Port))
+	if err != nil {
+		return nil, err
+	}
+	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "cmxsafe-open-reverse-tcp-v1", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
 	channel.maybeSendHeader()
 	c.channelsManager.addChannel(channel)
-	return &TCPOpenReverseForwardingChannelImpl{Channel: channel, BindAddr: bindAddr}, nil
+	return &TCPOpenReverseForwardingChannelImpl{Channel: channel, BindAddr: bindAddr, PeerAddr: peerAddr}, nil
 }
 
 // OpenUDPReverseForwardingChannel is the UDP analogue of
@@ -394,21 +406,23 @@ func (c *Conversation) OpenTCPReverseForwardingChannel(maxPacketSize uint64, dat
 // regular additional-bytes header for one address (the bind side), which
 // keeps the wire format consistent with the TCP variant and lets the
 // client dispatcher reuse the same parser.
-func (c *Conversation) OpenUDPReverseForwardingChannel(maxPacketSize uint64, datagramsQueueSize uint64, bindAddr *net.UDPAddr) (Channel, error) {
+func (c *Conversation) OpenUDPReverseForwardingChannel(maxPacketSize uint64, datagramsQueueSize uint64, bindAddr, peerAddr *net.UDPAddr) (Channel, error) {
 
 	str, err := c.streamCreator.OpenStream()
 	if err != nil {
 		return nil, err
 	}
 
-	additionalBytes := buildForwardingChannelAdditionalBytes(bindAddr.IP, uint16(bindAddr.Port))
-	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "open-request-reverse-udp", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
+	additionalBytes, err := buildCMXsafeReverseOpenAdditionalBytes(bindAddr.IP, uint16(bindAddr.Port), peerAddr.IP, uint16(peerAddr.Port))
+	if err != nil {
+		return nil, err
+	}
+	channel := NewChannel(uint64(c.controlStream.StreamID()), c.conversationID, uint64(str.StreamID()), "cmxsafe-open-reverse-udp-v1", maxPacketSize, &StreamByteReader{str}, str, nil, c.channelsManager, true, true, false, datagramsQueueSize, additionalBytes)
 	channel.setDatagramSender(c.getDatagramSenderForChannel(channel.ChannelID()))
 	channel.maybeSendHeader()
 	c.channelsManager.addChannel(channel)
-	return &UDPOpenReverseForwardingChannelImpl{Channel: channel, BindAddr: bindAddr}, nil
+	return &UDPOpenReverseForwardingChannelImpl{Channel: channel, BindAddr: bindAddr, PeerAddr: peerAddr}, nil
 }
-
 
 func (c *Conversation) AcceptChannel(ctx context.Context) (Channel, error) {
 	for {

@@ -9,6 +9,54 @@
 > but we need some time to come up with a nice permanent name.
 
 # SSH3: faster and rich secure shell using HTTP/3
+
+> **CMXsafe identity/mirror fork.** This branch is based on SSH3 pull request
+> [#166](https://github.com/francoismichel/ssh3/pull/166) and adds the strict,
+> versioned CMXsafe socket path described below. It is not wire-compatible with
+> legacy direct/reverse forwarding: peers fail clearly instead of silently
+> losing identity metadata.
+
+## CMXsafe Identity and Mirror Sockets
+
+For a direct TCP/UDP forward, the SSH3 client sends a CMXsafe-v1 header carrying
+only the source port it observed at ingress. It never supplies a source IP. The
+gateway derives the canonical IPv6 identity from the authenticated Unix UID and
+asks the separately installed `ssh3-uid-helper` v2 daemon to create a socket
+bound to that IPv6 and observed port. The descriptor is returned with
+`SCM_RIGHTS`; there is no root-owned network-socket fallback.
+
+For reverse TCP/UDP, the gateway sends the peer tuple it actually observed to
+the SSH3 client. The client validates that it is a non-reserved IPv6 address
+and an unprivileged port, asks `cmxsafe-endpointd` to install the peer `/128`,
+and creates the target connection with `LocalAddr` equal to that peer tuple.
+The address lease is released when forwarding ends. Failure to contact either
+helper fails the affected channel closed.
+
+Runtime dependencies:
+
+- `ssh3-uid-helper` protocol v2 at `/run/ssh3-helper/helper.sock`. The v2 request
+  assigns bytes 22..23 of the v1 reserved field to the observed source port;
+  UID remains the only supplied identity and the daemon derives source IPv6.
+  The client was derived from Younes Douici's original
+  [`ssh3-uid-helper`](https://github.com/YounesD75/ssh3-uid-helper) work, with
+  permission from the rights holder, and carries Apache-2.0 attribution.
+- `cmxsafe-endpointd` v1 at `/var/run/cmxsafe-endpointd.sock`, overridable with
+  `CMXSAFE_ENDPOINTD_SOCK`. Requests are `v1 ensure/release peer`; endpointd
+  derives lease ownership from Unix `SO_PEERCRED` (PID and process start time),
+  never from caller-provided ownership text.
+
+The gateway and endpoint must have the canonical IPv6 addresses configured as
+specified by CMXsafe. IPv4, loopback, multicast, link-local, zero/privileged
+mirror ports, unknown protocol versions, and missing helpers are rejected.
+
+Verification for this fork:
+
+```bash
+gofmt -w <modified-go-files>
+go test ./...
+go test -race ./...
+go build ./cmd/ssh3 ./cmd/ssh3-server
+```
 SSH3 is a complete revisit of the SSH
 protocol, mapping its semantics on top of the HTTP mechanisms. It comes from our research work and we (researchers) recently proposed it as an [Internet-Draft](https://www.ietf.org/how/ids/) ([draft-michel-remote-terminal-http3-00](https://datatracker.ietf.org/doc/draft-michel-remote-terminal-http3/)).
 

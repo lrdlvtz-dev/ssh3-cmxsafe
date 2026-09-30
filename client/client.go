@@ -216,8 +216,11 @@ func forwardTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net
 	}()
 }
 
-func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net.TCPConn) {
+func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net.TCPConn, cleanup func()) {
+	var cleanupOnce sync.Once
+	done := func() { cleanupOnce.Do(func() { conn.Close(); cleanup() }) }
 	go func() {
+		defer done()
 		defer conn.CloseWrite()
 		for {
 			select {
@@ -258,6 +261,7 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 	}()
 
 	go func() {
+		defer done()
 		defer channel.Close()
 		defer conn.CloseRead()
 		buf := make([]byte, channel.MaxPacketSize())
@@ -294,8 +298,11 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 	}()
 }
 
-func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, conn *net.UDPConn) {
+func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, conn *net.UDPConn, cleanup func()) {
+	var cleanupOnce sync.Once
+	done := func() { cleanupOnce.Do(func() { conn.Close(); cleanup() }) }
 	go func() {
+		defer done()
 		defer conn.Close()
 		for {
 			select {
@@ -317,6 +324,7 @@ func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, co
 	}()
 
 	go func() {
+		defer done()
 		defer channel.Close()
 		defer conn.Close()
 		buf := make([]byte, 1500)
@@ -462,13 +470,18 @@ func (d *reverseDispatcher) dispatch(channel ssh3.Channel) {
 			return
 		}
 		log.Debug().Msgf("reverse TCP: server bind %s -> dialing client target %s", c.BindAddr, h.clientTarget)
-		conn, err := net.DialTCP("tcp", nil, h.clientTarget)
-		if err != nil {
-			log.Error().Msgf("reverse TCP: could not dial client target %s: %s", h.clientTarget, err)
+		if c.PeerAddr == nil {
+			log.Error().Msgf("CMXsafe reverse TCP channel %d has no peer tuple", channel.ChannelID())
 			channel.Close()
 			return
 		}
-		forwardReverseTCPInBackground(h.ctx, channel, conn)
+		conn, release, err := dialMirrorTCP(channel, c.PeerAddr, h.clientTarget)
+		if err != nil {
+			log.Error().Msgf("reverse TCP: could not create mirror socket to %s: %s", h.clientTarget, err)
+			channel.Close()
+			return
+		}
+		forwardReverseTCPInBackground(h.ctx, channel, conn, release)
 
 	case *ssh3.UDPOpenReverseForwardingChannelImpl:
 		if c.BindAddr == nil {
@@ -485,13 +498,18 @@ func (d *reverseDispatcher) dispatch(channel ssh3.Channel) {
 			return
 		}
 		log.Debug().Msgf("reverse UDP: server bind %s -> dialing client target %s", c.BindAddr, h.clientTarget)
-		conn, err := net.DialUDP("udp", nil, h.clientTarget)
+		if c.PeerAddr == nil {
+			log.Error().Msgf("CMXsafe reverse UDP channel %d has no peer tuple", channel.ChannelID())
+			channel.Close()
+			return
+		}
+		conn, release, err := dialMirrorUDP(channel, c.PeerAddr, h.clientTarget)
 		if err != nil {
 			log.Error().Msgf("reverse UDP: could not dial client target %s: %s", h.clientTarget, err)
 			channel.Close()
 			return
 		}
-		forwardReverseUDPInBackground(h.ctx, channel, conn)
+		forwardReverseUDPInBackground(h.ctx, channel, conn, release)
 
 	default:
 		// Generic channel: only "agent-connection" is currently
@@ -735,23 +753,22 @@ func ListenUDPReuse(ctx context.Context, network string, laddr *net.UDPAddr) (*n
 	return uc, nil
 }
 
-
 func disableMulticastAll(uc *net.UDPConn) error {
-    rc, err := uc.SyscallConn()
-    if err != nil {
-        return err
-    }
-    var serr error
-    err = rc.Control(func(fd uintptr) {
-        // IP_MULTICAST_ALL = 49 on Linux; use unix.IP_MULTICAST_ALL for portability.
-        if e := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_MULTICAST_ALL, 0); e != nil {
-            serr = e
-        }
-    })
-    if err != nil {
-        return err
-    }
-    return serr
+	rc, err := uc.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	err = rc.Control(func(fd uintptr) {
+		// IP_MULTICAST_ALL = 49 on Linux; use unix.IP_MULTICAST_ALL for portability.
+		if e := unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_MULTICAST_ALL, 0); e != nil {
+			serr = e
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return serr
 }
 
 // ListenUDPWithAutoMulticast listens on udpAddr.  For a non-multicast
@@ -853,7 +870,6 @@ func joinOnInterfacesV4(p *ipv4.PacketConn, group *net.UDPAddr, ifaceName string
 	return nil
 }
 
-
 func joinOnInterfacesV6(p *ipv6.PacketConn, group *net.UDPAddr, ifaceName string) error {
 	if ifaceName != "" {
 		ifi, err := net.InterfaceByName(ifaceName)
@@ -888,9 +904,8 @@ func joinOnInterfacesV6(p *ipv6.PacketConn, group *net.UDPAddr, ifaceName string
 	}
 	return nil
 }
+
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-
-
 
 func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remoteUDPAddr *net.UDPAddr) (*net.UDPAddr, error) {
 	log.Debug().Msgf("start UDP forwarding from %s to %s", localUDPAddr, remoteUDPAddr)
@@ -899,7 +914,7 @@ func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remo
 		log.Error().Msgf("could not listen on UDP socket: %s", err)
 		return nil, err
 	}
-    // Close everything when ctx is canceled.
+	// Close everything when ctx is canceled.
 
 	forwardings := make(map[string]ssh3.Channel)
 	go func() {
@@ -912,7 +927,7 @@ func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remo
 			}
 			channel, ok := forwardings[addr.String()]
 			if !ok {
-				channel, err = c.OpenUDPForwardingChannel(30000, 10, localUDPAddr, remoteUDPAddr)
+				channel, err = c.OpenUDPForwardingChannel(30000, 10, addr, remoteUDPAddr)
 				if err != nil {
 					log.Error().Msgf("could open new UDP forwarding channel: %s", err)
 					return
@@ -958,7 +973,13 @@ func (c *Client) ForwardTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remo
 				log.Error().Msgf("could read on UDP socket: %s", err)
 				return
 			}
-			forwardingChannel, err := c.OpenTCPForwardingChannel(30000, 10, localTCPAddr, remoteTCPAddr)
+			peer, ok := conn.RemoteAddr().(*net.TCPAddr)
+			if !ok || peer.Port == 0 {
+				conn.Close()
+				log.Error().Msg("CMXsafe direct TCP requires an observed peer source port")
+				continue
+			}
+			forwardingChannel, err := c.OpenTCPForwardingChannel(30000, 10, peer, remoteTCPAddr)
 			if err != nil {
 				log.Error().Msgf("could open new UDP forwarding channel: %s", err)
 				return
@@ -977,14 +998,14 @@ func (c *Client) ForwardTCP(ctx context.Context, localTCPAddr *net.TCPAddr, remo
 // Return values:
 //   - ok=true                          listener was opened on the server.
 //   - ok=false, err!=nil               server reported a failure (with the
-//                                      reason string it sent), or sent
-//                                      data we cannot interpret as part of
-//                                      this protocol (likely version skew
-//                                      or corruption).
+//     reason string it sent), or sent
+//     data we cannot interpret as part of
+//     this protocol (likely version skew
+//     or corruption).
 //   - ok=false, err==nil, legacy=true  the peer never sent any setup data
-//                                      (read timeout, or EOF before any
-//                                      bytes).  Assume a server that
-//                                      predates this handshake.
+//     (read timeout, or EOF before any
+//     bytes).  Assume a server that
+//     predates this handshake.
 //
 // Anything *other* than "no data at all" is treated as a real signal:
 // either a known ack or a protocol error.  Silently ignoring unknown
@@ -1120,7 +1141,6 @@ func (c *Client) ReverseUDP(ctx context.Context, clientTargetAddr *net.UDPAddr, 
 	forwardingChannel.Close()
 	return serverBindAddr, nil
 }
-
 
 func (c *Client) RunSession(tty *os.File, forwardSSHAgent bool, command ...string) error {
 

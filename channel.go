@@ -3,6 +3,7 @@ package ssh3
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -119,12 +120,14 @@ type channelImpl struct {
 
 type UDPForwardingChannelImpl struct {
 	RemoteAddr *net.UDPAddr
+	SourcePort uint16
 	LocalAddr  *net.UDPAddr
 	Channel
 }
 
 type TCPForwardingChannelImpl struct {
 	RemoteAddr *net.TCPAddr
+	SourcePort uint16
 	Channel
 }
 
@@ -139,6 +142,7 @@ type TCPOpenReverseForwardingChannelImpl struct {
 	// data channel.  The client uses it to route the channel to the
 	// matching reverse-forward handler (see Client.reverseDispatcher).
 	BindAddr *net.TCPAddr
+	PeerAddr *net.TCPAddr
 	Channel
 }
 
@@ -152,6 +156,7 @@ type UDPOpenReverseForwardingChannelImpl struct {
 	// BindAddr is the server-side listening address that produced this
 	// data channel; see TCPOpenReverseForwardingChannelImpl.
 	BindAddr *net.UDPAddr
+	PeerAddr *net.UDPAddr
 	Channel
 }
 
@@ -176,16 +181,16 @@ type UDPOpenReverseForwardingChannelImpl struct {
 //
 // The message body is at least one byte:
 //
-//	+--------+------------------+
-//	| status |   reason (utf-8) |   (reason present only when status == Fail)
-//	+--------+------------------+
-//	  1 byte    0..N bytes
+//		+--------+------------------+
+//		| status |   reason (utf-8) |   (reason present only when status == Fail)
+//		+--------+------------------+
+//		  1 byte    0..N bytes
 //
-//   status == ReverseSetupAckOK   (0x00):
-//       listener opened successfully, no reason bytes follow.
-//   status == ReverseSetupAckFail (0x01):
-//       listener could not be opened; the bytes that follow are a UTF-8
-//       reason string suitable for surfacing to the user verbatim.
+//	  status == ReverseSetupAckOK   (0x00):
+//	      listener opened successfully, no reason bytes follow.
+//	  status == ReverseSetupAckFail (0x01):
+//	      listener could not be opened; the bytes that follow are a UTF-8
+//	      reason string suitable for surfacing to the user verbatim.
 //
 // The whole body is framed as a single ssh3 SSH_MSG_CHANNEL_DATA message
 // with DataType = SSH_EXTENDED_DATA_NONE, so framing comes from the SSH3
@@ -238,6 +243,78 @@ func buildForwardingChannelAdditionalBytes(remoteAddr net.IP, port uint16) []byt
 	binary.BigEndian.PutUint16(portBuf[:], uint16(port))
 	buf = append(buf, portBuf[:]...)
 	return buf
+}
+
+const (
+	cmxsafeWireMagic   uint32 = 0x434d5853 // "CMXS"
+	cmxsafeWireVersion byte   = 1
+)
+
+// buildCMXsafeDirectAdditionalBytes carries only the source port observed at
+// the ingress client.  The source IP is deliberately absent: the gateway must
+// derive it from the authenticated UID and never trust client-supplied identity.
+func buildCMXsafeDirectAdditionalBytes(sourcePort uint16, remoteAddr net.IP, remotePort uint16) ([]byte, error) {
+	if sourcePort == 0 {
+		return nil, errors.New("CMXsafe source port must be non-zero")
+	}
+	buf := make([]byte, 7)
+	binary.BigEndian.PutUint32(buf[0:4], cmxsafeWireMagic)
+	buf[4] = cmxsafeWireVersion
+	binary.BigEndian.PutUint16(buf[5:7], sourcePort)
+	return append(buf, buildForwardingChannelAdditionalBytes(remoteAddr, remotePort)...), nil
+}
+
+func parseCMXsafeDirectHeader(channelID uint64, r util.Reader) (uint16, net.IP, uint16, error) {
+	prefix := make([]byte, 7)
+	if _, err := io.ReadFull(r, prefix); err != nil {
+		return 0, nil, 0, fmt.Errorf("CMXsafe v1 direct header: %w", err)
+	}
+	if binary.BigEndian.Uint32(prefix[:4]) != cmxsafeWireMagic {
+		return 0, nil, 0, errors.New("legacy or invalid direct-forward wire header; CMXsafe v1 is required")
+	}
+	if prefix[4] != cmxsafeWireVersion {
+		return 0, nil, 0, fmt.Errorf("unsupported CMXsafe wire version %d", prefix[4])
+	}
+	sourcePort := binary.BigEndian.Uint16(prefix[5:7])
+	if sourcePort == 0 {
+		return 0, nil, 0, errors.New("CMXsafe direct-forward source port is zero")
+	}
+	ip, port, err := parseForwardingHeader(channelID, r)
+	return sourcePort, ip, port, err
+}
+
+func buildCMXsafeReverseOpenAdditionalBytes(bindIP net.IP, bindPort uint16, peerIP net.IP, peerPort uint16) ([]byte, error) {
+	if peerPort == 0 || peerIP.To4() != nil || peerIP.To16() == nil {
+		return nil, errors.New("CMXsafe reverse peer must be IPv6 with a non-zero port")
+	}
+	buf := make([]byte, 5)
+	binary.BigEndian.PutUint32(buf[:4], cmxsafeWireMagic)
+	buf[4] = cmxsafeWireVersion
+	buf = append(buf, buildForwardingChannelAdditionalBytes(bindIP, bindPort)...)
+	buf = append(buf, buildForwardingChannelAdditionalBytes(peerIP.To16(), peerPort)...)
+	return buf, nil
+}
+
+func parseCMXsafeReverseOpenHeader(channelID uint64, r util.Reader) (net.IP, uint16, net.IP, uint16, error) {
+	prefix := make([]byte, 5)
+	if _, err := io.ReadFull(r, prefix); err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("CMXsafe v1 reverse-open header: %w", err)
+	}
+	if binary.BigEndian.Uint32(prefix[:4]) != cmxsafeWireMagic || prefix[4] != cmxsafeWireVersion {
+		return nil, 0, nil, 0, errors.New("legacy or unsupported reverse-open wire header; CMXsafe v1 is required")
+	}
+	bindIP, bindPort, err := parseForwardingHeader(channelID, r)
+	if err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("parse reverse bind tuple: %w", err)
+	}
+	peerIP, peerPort, err := parseForwardingHeader(channelID, r)
+	if err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("parse reverse peer tuple: %w", err)
+	}
+	if peerIP.To4() != nil || peerIP.To16() == nil || peerPort == 0 {
+		return nil, 0, nil, 0, errors.New("reverse peer tuple must be IPv6 with a non-zero port")
+	}
+	return bindIP, bindPort, peerIP.To16(), peerPort, nil
 }
 
 // buildRequestReverseChannelAdditionalBytes serialises the two address
