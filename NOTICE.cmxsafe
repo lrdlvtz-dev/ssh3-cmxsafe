@@ -1,0 +1,14 @@
+CMXsafe SSH3 identity/mirror integration
+Copyright 2026 David de Hoz Diego
+
+This fork is licensed under the repository's Apache License 2.0.
+
+cmd/dial_uid.go is derived from the SSH3 UID helper client developed by
+Younes Douici during his CY Tech internship work and is redistributed and
+modified with permission from the rights holder. The separately deployed
+ssh3-uid-helper daemon remains a formal runtime dependency and is not vendored
+in this repository.
+
+The reverse-forwarding dispatcher and direct/reverse TCP/UDP forwarding base
+come from SSH3 pull request #166 by Dmitry Mikushin, preserving the commit
+history and authorship inherited by this fork.

@@ -3,6 +3,7 @@ package ssh3
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -119,13 +120,97 @@ type channelImpl struct {
 
 type UDPForwardingChannelImpl struct {
 	RemoteAddr *net.UDPAddr
+	SourcePort uint16
+	LocalAddr  *net.UDPAddr
 	Channel
 }
 
 type TCPForwardingChannelImpl struct {
 	RemoteAddr *net.TCPAddr
+	SourcePort uint16
 	Channel
 }
+
+type TCPReverseForwardingChannelImpl struct {
+	RemoteAddr *net.TCPAddr
+	LocalAddr  *net.TCPAddr
+	Channel
+}
+
+type TCPOpenReverseForwardingChannelImpl struct {
+	// BindAddr is the server-side listening address that produced this
+	// data channel.  The client uses it to route the channel to the
+	// matching reverse-forward handler (see Client.reverseDispatcher).
+	BindAddr *net.TCPAddr
+	PeerAddr *net.TCPAddr
+	Channel
+}
+
+type UDPReverseForwardingChannelImpl struct {
+	RemoteAddr *net.UDPAddr
+	LocalAddr  *net.UDPAddr
+	Channel
+}
+
+type UDPOpenReverseForwardingChannelImpl struct {
+	// BindAddr is the server-side listening address that produced this
+	// data channel; see TCPOpenReverseForwardingChannelImpl.
+	BindAddr *net.UDPAddr
+	PeerAddr *net.UDPAddr
+	Channel
+}
+
+// Reverse-forward setup handshake.
+//
+// Server-side reverse forwarding ("-R" in OpenSSH terms) requires the server
+// to bind a listening socket on behalf of the client.  That bind may fail
+// (port already in use, permission denied, address not available...) and
+// the client needs to know about the failure - otherwise it would proceed
+// to exec the user's command on top of a broken forwarding, exactly like
+// OpenSSH does when ExitOnForwardFailure is left at its default.
+//
+// To convey that result, the client and server use the same channel that
+// already carries the reverse-forward request (the "request-reverse-tcp"
+// or "request-reverse-udp" channel created by Conversation.Request*
+// ReverseChannel).  Immediately after the server attempts to open the
+// listener it writes exactly one data message back on that channel; the
+// client reads it before closing the channel.
+//
+// Wire format of the data message
+// -------------------------------
+//
+// The message body is at least one byte:
+//
+//		+--------+------------------+
+//		| status |   reason (utf-8) |   (reason present only when status == Fail)
+//		+--------+------------------+
+//		  1 byte    0..N bytes
+//
+//	  status == ReverseSetupAckOK   (0x00):
+//	      listener opened successfully, no reason bytes follow.
+//	  status == ReverseSetupAckFail (0x01):
+//	      listener could not be opened; the bytes that follow are a UTF-8
+//	      reason string suitable for surfacing to the user verbatim.
+//
+// The whole body is framed as a single ssh3 SSH_MSG_CHANNEL_DATA message
+// with DataType = SSH_EXTENDED_DATA_NONE, so framing comes from the SSH3
+// layer; there is no per-handshake length field.
+//
+// Backwards compatibility
+// -----------------------
+//
+// A server that does not implement this handshake (the original PR #148
+// baseline) simply never writes anything on the request channel and lets
+// it close.  The client treats "EOF before any data" and "read timeout"
+// as that legacy case: it logs a warning and continues, so that newer
+// clients keep working against older servers.  Any data *other* than a
+// recognised OK/Fail opcode is treated as a protocol error - silently
+// accepting unknown payloads here would defeat the point of the
+// handshake.
+const (
+	ReverseSetupAckOK   byte = 0x00
+	ReverseSetupAckFail byte = 0x01
+)
 
 func buildHeader(conversationStreamID uint64, channelType string, maxPacketSize uint64, additionalBytes []byte) []byte {
 	channelTypeBuf := make([]byte, util.SSHStringLen(channelType))
@@ -160,6 +245,99 @@ func buildForwardingChannelAdditionalBytes(remoteAddr net.IP, port uint16) []byt
 	return buf
 }
 
+const (
+	cmxsafeWireMagic   uint32 = 0x434d5853 // "CMXS"
+	cmxsafeWireVersion byte   = 1
+)
+
+// buildCMXsafeDirectAdditionalBytes carries only the source port observed at
+// the ingress client.  The source IP is deliberately absent: the gateway must
+// derive it from the authenticated UID and never trust client-supplied identity.
+func buildCMXsafeDirectAdditionalBytes(sourcePort uint16, remoteAddr net.IP, remotePort uint16) ([]byte, error) {
+	if sourcePort == 0 {
+		return nil, errors.New("CMXsafe source port must be non-zero")
+	}
+	buf := make([]byte, 7)
+	binary.BigEndian.PutUint32(buf[0:4], cmxsafeWireMagic)
+	buf[4] = cmxsafeWireVersion
+	binary.BigEndian.PutUint16(buf[5:7], sourcePort)
+	return append(buf, buildForwardingChannelAdditionalBytes(remoteAddr, remotePort)...), nil
+}
+
+func parseCMXsafeDirectHeader(channelID uint64, r util.Reader) (uint16, net.IP, uint16, error) {
+	prefix := make([]byte, 7)
+	if _, err := io.ReadFull(r, prefix); err != nil {
+		return 0, nil, 0, fmt.Errorf("CMXsafe v1 direct header: %w", err)
+	}
+	if binary.BigEndian.Uint32(prefix[:4]) != cmxsafeWireMagic {
+		return 0, nil, 0, errors.New("legacy or invalid direct-forward wire header; CMXsafe v1 is required")
+	}
+	if prefix[4] != cmxsafeWireVersion {
+		return 0, nil, 0, fmt.Errorf("unsupported CMXsafe wire version %d", prefix[4])
+	}
+	sourcePort := binary.BigEndian.Uint16(prefix[5:7])
+	if sourcePort == 0 {
+		return 0, nil, 0, errors.New("CMXsafe direct-forward source port is zero")
+	}
+	ip, port, err := parseForwardingHeader(channelID, r)
+	return sourcePort, ip, port, err
+}
+
+func buildCMXsafeReverseOpenAdditionalBytes(bindIP net.IP, bindPort uint16, peerIP net.IP, peerPort uint16) ([]byte, error) {
+	if peerPort == 0 || peerIP.To4() != nil || peerIP.To16() == nil {
+		return nil, errors.New("CMXsafe reverse peer must be IPv6 with a non-zero port")
+	}
+	buf := make([]byte, 5)
+	binary.BigEndian.PutUint32(buf[:4], cmxsafeWireMagic)
+	buf[4] = cmxsafeWireVersion
+	buf = append(buf, buildForwardingChannelAdditionalBytes(bindIP, bindPort)...)
+	buf = append(buf, buildForwardingChannelAdditionalBytes(peerIP.To16(), peerPort)...)
+	return buf, nil
+}
+
+func parseCMXsafeReverseOpenHeader(channelID uint64, r util.Reader) (net.IP, uint16, net.IP, uint16, error) {
+	prefix := make([]byte, 5)
+	if _, err := io.ReadFull(r, prefix); err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("CMXsafe v1 reverse-open header: %w", err)
+	}
+	if binary.BigEndian.Uint32(prefix[:4]) != cmxsafeWireMagic || prefix[4] != cmxsafeWireVersion {
+		return nil, 0, nil, 0, errors.New("legacy or unsupported reverse-open wire header; CMXsafe v1 is required")
+	}
+	bindIP, bindPort, err := parseForwardingHeader(channelID, r)
+	if err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("parse reverse bind tuple: %w", err)
+	}
+	peerIP, peerPort, err := parseForwardingHeader(channelID, r)
+	if err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("parse reverse peer tuple: %w", err)
+	}
+	if peerIP.To4() != nil || peerIP.To16() == nil || peerPort == 0 {
+		return nil, 0, nil, 0, errors.New("reverse peer tuple must be IPv6 with a non-zero port")
+	}
+	return bindIP, bindPort, peerIP.To16(), peerPort, nil
+}
+
+// buildRequestReverseChannelAdditionalBytes serialises the two address
+// pairs carried by a request-reverse-{tcp,udp} channel header: the
+// server-side bind address first, then the client-side target address.
+// The encoding for each pair is the same one buildForwardingChannelAdditionalBytes
+// uses (varint address family, raw address bytes, big-endian uint16 port).
+//
+// This function replaces two near-identical helpers
+// (buildRequestTCPReverseChannelAdditionalBytes and the UDP one) and drops
+// the duplicate-port-trailer workaround they carried.  That trailer was
+// a workaround for parseRequestReverseHeader using bare io.Reader.Read on
+// the address bytes: Read is not required to return as many bytes as the
+// slice can hold, and on a short read the next 2 bytes of the port slot
+// were silently being consumed as part of the previous address.  The
+// parser now uses io.ReadFull, so the wire format is back to one port per
+// pair and the workaround can go.
+func buildRequestReverseChannelAdditionalBytes(localAddr net.IP, localPort uint16, remoteAddr net.IP, remotePort uint16) []byte {
+	buf := buildForwardingChannelAdditionalBytes(localAddr, localPort)
+	buf = append(buf, buildForwardingChannelAdditionalBytes(remoteAddr, remotePort)...)
+	return buf
+}
+
 func parseHeader(channelID uint64, r util.Reader) (conversationControlStreamID ControlStreamID, channelType string, maxPacketSize uint64, err error) {
 	conversationControlStreamID, err = util.ReadVarInt(r)
 	if err != nil {
@@ -191,19 +369,38 @@ func parseForwardingHeader(channelID uint64, buf util.Reader) (net.IP, uint16, e
 		return nil, 0, fmt.Errorf("invalid address family: %d", addressFamily)
 	}
 
-	_, err = buf.Read(address)
-	if err != nil {
+	// io.Reader.Read does not guarantee filling the whole slice in one
+	// call; use io.ReadFull so the next field does not silently consume
+	// the leftover bytes of this one.  (That bug is what previously
+	// required buildRequestReverseChannelAdditionalBytes to emit a
+	// duplicated port trailer to "make the port arrive".)
+	if _, err = io.ReadFull(buf, address); err != nil {
 		return nil, 0, err
 	}
 
 	var portBuf [2]byte
-	_, err = buf.Read(portBuf[:])
-	if err != nil {
+	if _, err = io.ReadFull(buf, portBuf[:]); err != nil {
 		return nil, 0, err
 	}
 	port := binary.BigEndian.Uint16(portBuf[:])
 
 	return address, port, nil
+}
+
+func parseRequestReverseHeader(channelID uint64, buf util.Reader) (net.IP, uint16, net.IP, uint16, error) {
+	// Two consecutive forwarding-header pairs: the server-bind address
+	// first, then the client-target address.  See parseForwardingHeader
+	// for the io.ReadFull rationale (and the previous "duplicate the
+	// port" workaround it makes obsolete).
+	localAddress, localPort, err := parseForwardingHeader(channelID, buf)
+	if err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("parse local address: %w", err)
+	}
+	remoteAddress, remotePort, err := parseForwardingHeader(channelID, buf)
+	if err != nil {
+		return nil, 0, nil, 0, fmt.Errorf("parse remote address: %w", err)
+	}
+	return localAddress, localPort, remoteAddress, remotePort, nil
 }
 
 func parseUDPForwardingHeader(channelID uint64, buf util.Reader) (*net.UDPAddr, error) {
@@ -226,6 +423,34 @@ func parseTCPForwardingHeader(channelID uint64, buf util.Reader) (*net.TCPAddr, 
 		IP:   address,
 		Port: int(port),
 	}, nil
+}
+
+func parseTCPRequestReverseHeader(channelID uint64, buf util.Reader) (*net.TCPAddr, *net.TCPAddr, error) {
+	localaddress, localport, remoteaddress, remoteport, err := parseRequestReverseHeader(channelID, buf)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &net.TCPAddr{
+			IP:   localaddress,
+			Port: int(localport),
+		}, &net.TCPAddr{
+			IP:   remoteaddress,
+			Port: int(remoteport),
+		}, nil
+}
+
+func parseUDPRequestReverseHeader(channelID uint64, buf util.Reader) (*net.UDPAddr, *net.UDPAddr, error) {
+	localaddress, localport, remoteaddress, remoteport, err := parseRequestReverseHeader(channelID, buf)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &net.UDPAddr{
+			IP:   localaddress,
+			Port: int(localport),
+		}, &net.UDPAddr{
+			IP:   remoteaddress,
+			Port: int(remoteport),
+		}, nil
 }
 
 func NewChannel(conversationStreamID uint64, conversationID ConversationID, channelID uint64, channelType string, maxPacketSize uint64, recv quic.ReceiveStream,

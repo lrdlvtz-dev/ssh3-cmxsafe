@@ -1,8 +1,7 @@
 name: Go
 on:
-  pull_request:
-    paths-ignore:
-      - '**/README.md'
+  # Upstream portability matrix retained for manual comparison only.  The
+  # CMXsafe socket path uses Linux credentials, SCM_RIGHTS and x/sys/unix.
   workflow_dispatch:
 jobs:
   build-linux:

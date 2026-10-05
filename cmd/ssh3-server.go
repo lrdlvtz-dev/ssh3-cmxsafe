@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"syscall"
+	"time"
 	"unsafe"
 
 	_ "net/http/pprof"
@@ -247,6 +248,84 @@ func forwardTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net
 			}
 		}
 	}()
+}
+
+func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net.TCPConn) {
+	go func() {
+		defer channel.Close()
+		defer conn.CloseRead()
+		buf := make([]byte, channel.MaxPacketSize())
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			n, err := conn.Read(buf)
+			if err != nil && err != io.EOF {
+				log.Error().Msgf("could read data on TCP socket: %s", err)
+				return
+			}
+			_, errWrite := channel.WriteData(buf[:n], ssh3Messages.SSH_EXTENDED_DATA_NONE)
+			if errWrite != nil {
+				switch quicErr := errWrite.(type) {
+				case *quic.StreamError:
+					if quicErr.Remote && quicErr.ErrorCode == 42 {
+						log.Info().Msgf("writing was canceled by the remote, closing the socket: %s", errWrite)
+					} else {
+						log.Error().Msgf("unhandled quic stream error: %+v", quicErr)
+					}
+				default:
+					log.Error().Msgf("could send data on channel: %s", errWrite)
+				}
+				return
+			}
+			if err == io.EOF {
+				return
+			}
+		}
+	}()
+
+	go func() {
+		defer conn.CloseWrite()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			genericMessage, err := channel.NextMessage()
+			if err == io.EOF {
+				log.Info().Msgf("eof on reverse-tcp-forwarding channel %d", channel.ChannelID())
+			} else if err != nil {
+				log.Error().Msgf("could get message from tcp forwarding channel: %s", err)
+				return
+			}
+
+			// nothing to process
+			if genericMessage == nil {
+				return
+			}
+
+			switch message := genericMessage.(type) {
+			case *ssh3Messages.DataOrExtendedDataMessage:
+				if message.DataType == ssh3Messages.SSH_EXTENDED_DATA_NONE {
+					_, err := conn.Write([]byte(message.Data))
+					if err != nil {
+						log.Error().Msgf("could not write data on TCP socket: %s", err)
+						// signal the write error to the peer
+						channel.CancelRead()
+						return
+					}
+				} else {
+					log.Warn().Msgf("ignoring message data of unexpected type %d on TCP forwarding channel %d", message.DataType, channel.ChannelID())
+				}
+			default:
+				log.Warn().Msgf("ignoring message of type %T on TCP forwarding channel %d", message, channel.ChannelID())
+			}
+		}
+	}()
+
 }
 
 func execCmdInBackground(channel ssh3.Channel, openPty *openPty, user *unix_util.User, runningCommand *runningCommand, authAgentSocketPath string) error {
@@ -529,10 +608,10 @@ func newExitSignalReq(user *unix_util.User, channel ssh3.Channel, request ssh3Me
 }
 
 func handleUDPForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.UDPForwardingChannelImpl) error {
-	// TODO: currently, the rights for socket creation are not checked. The socket is opened with the process's uid and gid
-	// Not sure how to handled that in go since we cannot temporarily change the uid/gid without potentially impacting every
-	// other goroutine
-	conn, err := net.DialUDP("udp", nil, channel.RemoteAddr)
+	if user.Uid > uint64(^uint32(0)) {
+		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
+	}
+	conn, err := dialIdentityUDP(uint32(user.Uid), channel.SourcePort, channel.RemoteAddr)
 	if err != nil {
 		return err
 	}
@@ -541,14 +620,153 @@ func handleUDPForwardingChannel(ctx context.Context, user *unix_util.User, conv 
 }
 
 func handleTCPForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.TCPForwardingChannelImpl) error {
-	// TODO: currently, the rights for socket creation are not checked. The socket is opened with the process's uid and gid
-	// Not sure how to handled that in go since we cannot temporarily change the uid/gid without potentially impacting every
-	// other goroutine
-	conn, err := net.DialTCP("tcp", nil, channel.RemoteAddr)
+	if user.Uid > uint64(^uint32(0)) {
+		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
+	}
+	conn, err := dialIdentityTCP(uint32(user.Uid), channel.SourcePort, channel.RemoteAddr)
 	if err != nil {
 		return err
 	}
 	forwardTCPInBackground(ctx, channel, conn)
+	return nil
+}
+
+// Wire-protocol for the reverse-forward setup acknowledgement.  After
+// receiving a request-reverse-{tcp,udp} channel the server attempts to open
+// the requested listener and immediately writes a single status byte back to
+// the client on the same channel using the ssh3.ReverseSetupAck{OK,Fail}
+// constants (see channel.go).
+//
+// writeReverseSetupAck sends one such status message.  The caller is
+// responsible for tearing down any resources (listener, channel) if the
+// write fails: a successful Listen* followed by a failed ack write means
+// the client has timed us out and the listener would otherwise be orphaned
+// on this side.
+func writeReverseSetupAck(channel ssh3.Channel, status byte, reason string) error {
+	buf := append([]byte{status}, []byte(reason)...)
+	if _, err := channel.WriteData(buf, ssh3Messages.SSH_EXTENDED_DATA_NONE); err != nil {
+		return fmt.Errorf("write reverse-forward setup ack: %w", err)
+	}
+	return nil
+}
+
+// Copied from client.go ForwardTCP()
+func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.TCPReverseForwardingChannelImpl) error {
+	if user.Uid > uint64(^uint32(0)) {
+		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
+	}
+	conn, err := listenIdentityTCP(uint32(user.Uid), channel.LocalAddr)
+	if err != nil {
+		log.Error().Msgf("could not listen on TCP %s: %s", channel.LocalAddr, err)
+		// Best-effort: tell the client why we are giving up.  We do not
+		// care if this ack write also fails - the channel is about to
+		// be closed and the client will see EOF.
+		_ = writeReverseSetupAck(channel, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen tcp %s: %s", channel.LocalAddr, err))
+		channel.Close()
+		return err
+	}
+	if ackErr := writeReverseSetupAck(channel, ssh3.ReverseSetupAckOK, ""); ackErr != nil {
+		// We successfully opened the listener but the client is no
+		// longer there to receive our confirmation (e.g. it hit its
+		// own ack timeout).  Closing the listener here prevents a
+		// resource leak: without this, the socket would stay bound
+		// and silently accept connections that nobody would ever
+		// relay through the QUIC tunnel.
+		log.Error().Msgf("reverse TCP %s: ack write failed, closing orphan listener: %s", channel.LocalAddr, ackErr)
+		conn.Close()
+		channel.Close()
+		return ackErr
+	}
+
+	go func() {
+		for {
+			conn, err := conn.AcceptTCP()
+			if err != nil {
+				log.Error().Msgf("could not accept on TCP listener %s: %s", channel.LocalAddr, err)
+				return
+			}
+
+			peer, ok := conn.RemoteAddr().(*net.TCPAddr)
+			if !ok || peer.IP.To4() != nil || peer.IP.To16() == nil || peer.Port == 0 {
+				conn.Close()
+				log.Error().Msgf("CMXsafe reverse TCP requires an observed IPv6 peer tuple, got %v", conn.RemoteAddr())
+				continue
+			}
+			forwardingChannel, err := conv.OpenTCPReverseForwardingChannel(30000, 10, channel.LocalAddr, peer)
+			if err != nil {
+				log.Error().Msgf("could not open new TCP reverse forwarding channel: %s", err)
+				return
+			}
+			forwardReverseTCPInBackground(ctx, forwardingChannel, conn)
+		}
+	}()
+	return nil
+}
+
+func handleUDPReverseForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, ch *ssh3.UDPReverseForwardingChannelImpl) error {
+	if user.Uid > uint64(^uint32(0)) {
+		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
+	}
+	conn, err := bindIdentityUDP(uint32(user.Uid), ch.LocalAddr)
+	if err != nil {
+		log.Error().Msgf("could not listen on UDP %s: %s", ch.LocalAddr, err)
+		_ = writeReverseSetupAck(ch, ssh3.ReverseSetupAckFail, fmt.Sprintf("listen udp %s: %s", ch.LocalAddr, err))
+		ch.Close()
+		return err
+	}
+	if ackErr := writeReverseSetupAck(ch, ssh3.ReverseSetupAckOK, ""); ackErr != nil {
+		// See handleTCPReverseForwardingChannel for the rationale: a
+		// successful Listen followed by a failed ack write must not
+		// leave the listener bound on this side.
+		log.Error().Msgf("reverse UDP %s: ack write failed, closing orphan listener: %s", ch.LocalAddr, ackErr)
+		conn.Close()
+		ch.Close()
+		return ackErr
+	}
+	forwardings := make(map[string]ssh3.Channel)
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, addr, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				log.Error().Msgf("could not read on UDP socket: %s", err)
+				return
+			}
+			channel, ok := forwardings[addr.String()]
+			if !ok {
+				if addr.IP.To4() != nil || addr.IP.To16() == nil || addr.Port == 0 {
+					log.Error().Msgf("CMXsafe reverse UDP requires an observed IPv6 peer tuple, got %v", addr)
+					continue
+				}
+				channel, err = conv.OpenUDPReverseForwardingChannel(30000, 10, ch.LocalAddr, addr)
+				if err != nil {
+					log.Error().Msgf("could not open new UDP reverse forwarding channel: %s", err)
+					return
+				}
+				forwardings[addr.String()] = channel
+				go func() {
+					for {
+						dgram, err := channel.ReceiveDatagram(ctx)
+						if err != nil {
+							log.Error().Msgf("could not receive datagram on channel: %s", err)
+							return
+						}
+						_, err = conn.WriteToUDP(dgram, addr)
+						if err != nil {
+							log.Error().Msgf("could not write datagram on socket: %s", err)
+							return
+						}
+					}
+				}()
+			}
+
+			err = channel.SendDatagram(buf[:n])
+			if err != nil {
+				log.Error().Msgf("could not send datagram: %s", err)
+				return
+			}
+		}
+	}()
 	return nil
 }
 
@@ -829,7 +1047,11 @@ func ServerMain() int {
 	log.Debug().Msgf("version %s", ssh3.GetCurrentSoftwareVersion())
 
 	quicConf := &quic.Config{
-		Allow0RTT: true,
+		Allow0RTT:             false,
+		KeepAlivePeriod:       1 * time.Second,
+		EnableDatagrams:       true,
+		MaxIncomingStreams:    10000, // client-initiated bidi streams allowed
+		MaxIncomingUniStreams: 10000, // client-initiated uni streams allowed
 	}
 
 	var err error
@@ -859,6 +1081,10 @@ func ServerMain() int {
 				handleUDPForwardingChannel(conv.Context(), authenticatedUser, conv, c)
 			case *ssh3.TCPForwardingChannelImpl:
 				handleTCPForwardingChannel(conv.Context(), authenticatedUser, conv, c)
+			case *ssh3.TCPReverseForwardingChannelImpl:
+				handleTCPReverseForwardingChannel(conv.Context(), authenticatedUser, conv, c)
+			case *ssh3.UDPReverseForwardingChannelImpl:
+				handleUDPReverseForwardingChannel(conv.Context(), authenticatedUser, conv, c)
 			default:
 				runningSessions.Insert(channel, &runningSession{
 					channelState: LARVAL,

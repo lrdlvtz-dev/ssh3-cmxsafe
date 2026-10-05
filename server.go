@@ -78,19 +78,42 @@ func NewServer(maxPacketSize uint64, defaultDatagramQueueSize uint64, h3Server *
 			stream, nil, conversation.channelsManager, false, false, true, defaultDatagramQueueSize, nil)
 
 		switch channelInfo.ChannelType {
-		case "direct-udp":
-			udpAddr, err := parseUDPForwardingHeader(channelInfo.ChannelID, &StreamByteReader{stream})
+		case "cmxsafe-direct-udp-v1":
+			sourcePort, ip, port, err := parseCMXsafeDirectHeader(channelInfo.ChannelID, &StreamByteReader{stream})
 			if err != nil {
 				return false, err
 			}
 			newChannel.setDatagramSender(conversation.getDatagramSenderForChannel(channelInfo.ChannelID))
-			newChannel = &UDPForwardingChannelImpl{Channel: newChannel, RemoteAddr: udpAddr}
-		case "direct-tcp":
-			tcpAddr, err := parseTCPForwardingHeader(channelInfo.ChannelID, &StreamByteReader{stream})
+			newChannel = &UDPForwardingChannelImpl{Channel: newChannel, RemoteAddr: &net.UDPAddr{IP: ip, Port: int(port)}, SourcePort: sourcePort}
+		case "cmxsafe-direct-tcp-v1":
+			sourcePort, ip, port, err := parseCMXsafeDirectHeader(channelInfo.ChannelID, &StreamByteReader{stream})
 			if err != nil {
 				return false, err
 			}
-			newChannel = &TCPForwardingChannelImpl{Channel: newChannel, RemoteAddr: tcpAddr}
+			newChannel = &TCPForwardingChannelImpl{Channel: newChannel, RemoteAddr: &net.TCPAddr{IP: ip, Port: int(port)}, SourcePort: sourcePort}
+		case "direct-tcp", "direct-udp":
+			return false, fmt.Errorf("legacy direct-forward channel %q rejected: CMXsafe v1 source port is required", channelInfo.ChannelType)
+
+		case "request-reverse-tcp":
+			tcpAddrLocal, tcpAddrRemote, err := parseTCPRequestReverseHeader(channelInfo.ChannelID, &StreamByteReader{stream})
+			if err != nil {
+				return false, err
+			}
+
+			newChannel = &TCPReverseForwardingChannelImpl{Channel: newChannel, RemoteAddr: tcpAddrRemote, LocalAddr: tcpAddrLocal}
+			//The channel is only used to receive the data featuring the reverse proxy and is closed afterwards
+			//In OpenSSH, the client does this by sendinng a GLOBAL_REQUEST "tcpip-forward", but I think in SSH3 global messages are not implemented
+
+			//tcpAddrLocal: Local socket within the server machine where will be proxied a local service at reach of the ssh3 client
+			//tcpAddrRemote: The remote socket at reach of the SSH3 client to be proxied within the machine hosting the ssh3 server
+
+		case "request-reverse-udp":
+			tcpAddrLocal, tcpAddrRemote, err := parseUDPRequestReverseHeader(channelInfo.ChannelID, &StreamByteReader{stream})
+			if err != nil {
+				return false, err
+			}
+
+			newChannel = &UDPReverseForwardingChannelImpl{Channel: newChannel, RemoteAddr: tcpAddrRemote, LocalAddr: tcpAddrLocal}
 		}
 		conversation.channelsAcceptQueue.Add(newChannel)
 		return true, nil

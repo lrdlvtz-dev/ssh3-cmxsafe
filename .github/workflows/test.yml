@@ -1,8 +1,7 @@
 name: Go
 on:
-  pull_request:
-    paths-ignore:
-      - '**/README.md'
+  # Upstream workflow retained for manual comparison.  Automatic checks for
+  # this fork live in cmxsafe-linux.yml because the integration is Linux-only.
   workflow_dispatch:
 jobs:
   build-linux:
