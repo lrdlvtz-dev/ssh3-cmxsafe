@@ -89,7 +89,7 @@ jobs:
 
       - name: Verify authorized and unauthorized authentication
         env:
-          GINKGO_EXTRA_ARGS: --label-filter=cmxsafe-smoke
+          GINKGO_EXTRA_ARGS: --label-filter=cmxsafe-smoke||cmxsafe-policy
           KEEP_USERS: "0"
           SSH3_INTEGRATION_TESTS_CURRENT_ONLY: "1"
         run: ./scripts/run_integration_tests.sh

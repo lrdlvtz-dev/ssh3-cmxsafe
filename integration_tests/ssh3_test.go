@@ -7,8 +7,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	osuser "os/user"
 	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -792,6 +794,44 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			})
 
 			Context("Server behaviour", func() {
+				It("Should run a forced command as the authenticated Unix user", Label("cmxsafe-policy"), func() {
+					authorizedPath := fmt.Sprintf("/home/%s/.ssh3/authorized_identities", username)
+					originalAuthorized, err := os.ReadFile(authorizedPath)
+					Expect(err).ToNot(HaveOccurred())
+					DeferCleanup(func() {
+						Expect(os.WriteFile(authorizedPath, originalAuthorized, 0600)).To(Succeed())
+					})
+
+					account, err := osuser.Lookup(username)
+					Expect(err).ToNot(HaveOccurred())
+					expectedGroups, err := exec.Command("id", "-G", username).Output()
+					Expect(err).ToNot(HaveOccurred())
+					expectedGroupsText := strings.TrimSpace(string(expectedGroups))
+
+					forcedCommand := `printf 'uid=%s gid=%s groups=%s original=<%s>\n' "$(id -u)" "$(id -g)" "$(id -G)" "$SSH_ORIGINAL_COMMAND"`
+					escapeOption := func(value string) string {
+						return strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`)
+					}
+					publicKey, err := os.ReadFile(rsaPrivKeyPath + ".pub")
+					Expect(err).ToNot(HaveOccurred())
+					authorizedLine := fmt.Sprintf("command=\"%s\",no-pty %s", escapeOption(forcedCommand), strings.TrimSpace(string(publicKey)))
+					Expect(os.WriteFile(authorizedPath, []byte(authorizedLine+"\n"), 0600)).To(Succeed())
+
+					bypassPath := fmt.Sprintf("/tmp/ssh3-force-command-bypass-%d", os.Getpid())
+					_ = os.Remove(bypassPath)
+					DeferCleanup(func() { _ = os.Remove(bypassPath) })
+					originalCommand := fmt.Sprintf("touch %s; printf bypass", bypassPath)
+					clientArgs = append(getClientArgs(rsaPrivKeyPath), originalCommand)
+					command := exec.Command(ssh3Path, clientArgs...)
+					session, err := Start(command, GinkgoWriter, GinkgoWriter)
+					Expect(err).ToNot(HaveOccurred())
+					Eventually(session).Should(Exit(0))
+					Eventually(session).Should(Say(fmt.Sprintf("uid=%s gid=%s groups=%s original=<%s>\n", account.Uid, account.Gid, expectedGroupsText, originalCommand)))
+					_, err = os.Stat(bypassPath)
+					Expect(os.IsNotExist(err)).To(BeTrue())
+					Expect(account.Uid).ToNot(Equal("0"))
+				})
+
 				It("Should not grand access to non-authorized identity", Label("cmxsafe-smoke"), func() {
 					clientArgs = append(getClientArgs(attackerPrivKeyPath), "echo", "Hello, World!")
 

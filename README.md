@@ -240,6 +240,15 @@ By default, the SSH3 server will look for identities in the `~/.ssh/authorized_k
 `~/.ssh3/authorized_identities` allows new identities such as OpenID Connect (`oidc`) discussed [below](#openid-connect-authentication-still-experimental).
 Popular key types such as `rsa`, `ed25519` and keys in the OpenSSH format can be used.
 
+For public-key identities, SSH3 enforces the OpenSSH options emitted by
+CMXsafe: `command="..."`, `no-pty`, `permitopen="..."`,
+`permitlisten="..."`, `no-port-forwarding`, `no-agent-forwarding`,
+`no-X11-forwarding`, `restrict`, and `port-forwarding`. Unknown or malformed
+options fail closed. Forwarding permissions accept IP literals (or `*`), and
+apply to TCP and UDP. A forced command receives the requested command only in
+`SSH_ORIGINAL_COMMAND` and runs with the authenticated user's UID, primary GID,
+and supplementary groups.
+
 ### Using the SSH3 client
 Once you have an SSH3 server running, you can connect to it using the SSH3 client similarly to what
 you did with your classical SSHv2 tool.

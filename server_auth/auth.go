@@ -67,13 +67,14 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 			return
 		}
 		base64ConvID := base64.StdEncoding.EncodeToString(convID[:])
-		finishAuthentication := func(username string, _ *ssh3.Conversation, responseWriter http.ResponseWriter, request *http.Request) {
+		finishAuthentication := func(username string, policy ssh3.AuthorizationPolicy, responseWriter http.ResponseWriter, request *http.Request) {
 			conversation, err := ssh3.NewServerConversation(ctx, nil, qconn, nil, defaultMaxPacketSize, peerVersion)
 			if err != nil {
 				log.Error().Err(err).Msg("could not create authenticated server conversation")
 				responseWriter.WriteHeader(http.StatusInternalServerError)
 				return
 			}
+			conversation.SetAuthorizationPolicy(policy)
 			conversation.AttachServerControlStream(httpStreamer.HTTPStream())
 			handlerFunc(username, conversation, responseWriter, request)
 		}
@@ -100,7 +101,7 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 			case *WrappedPluginVerifier:
 				if verifier.Verify(r, base64ConvID) {
 					log.Debug().Msgf("request for user %s successfully verified by plugin", username)
-					finishAuthentication(username, nil, w, r)
+					finishAuthentication(username, verifier.AuthorizationPolicy(), w, r)
 					return
 				}
 			}
@@ -110,16 +111,16 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 
 		authorization := r.Header.Get("Authorization")
 		if enablePasswordLogin && strings.HasPrefix(authorization, "Basic ") {
-			HandleBasicAuth(finishAuthentication, nil)(w, r)
+			HandleBasicAuth(finishAuthentication)(w, r)
 		} else if strings.HasPrefix(authorization, "Bearer ") {
-			HandleBearerAuth(username, base64ConvID, HandleJWTAuth(username, nil, identityVerifiers, finishAuthentication))(w, r)
+			HandleBearerAuth(username, base64ConvID, HandleJWTAuth(username, identityVerifiers, finishAuthentication))(w, r)
 		} else {
 			w.WriteHeader(http.StatusUnauthorized)
 		}
 	}, nil
 }
 
-func HandleBasicAuth(handlerFunc ssh3.AuthenticatedHandlerFunc, conv *ssh3.Conversation) http.HandlerFunc {
+func HandleBasicAuth(handlerFunc FinishAuthenticationFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		username, password, ok := r.BasicAuth()
 		if !ok {
@@ -135,6 +136,6 @@ func HandleBasicAuth(handlerFunc ssh3.AuthenticatedHandlerFunc, conv *ssh3.Conve
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		handlerFunc(username, conv, w, r)
+		handlerFunc(username, unrestrictedPolicy(), w, r)
 	}
 }
