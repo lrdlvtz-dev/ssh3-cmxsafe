@@ -102,7 +102,10 @@ type channelImpl struct {
 
 	channelCloseListener
 
-	recv           quic.ReceiveStream
+	recv interface {
+		io.Reader
+		CancelRead(quic.StreamErrorCode)
+	}
 	send           io.WriteCloser
 	datagramsQueue *util.DatagramsQueue
 	PtyReqHandler
@@ -453,7 +456,10 @@ func parseUDPRequestReverseHeader(channelID uint64, buf util.Reader) (*net.UDPAd
 		}, nil
 }
 
-func NewChannel(conversationStreamID uint64, conversationID ConversationID, channelID uint64, channelType string, maxPacketSize uint64, recv quic.ReceiveStream,
+func NewChannel(conversationStreamID uint64, conversationID ConversationID, channelID uint64, channelType string, maxPacketSize uint64, recv interface {
+	io.Reader
+	CancelRead(quic.StreamErrorCode)
+},
 	send io.WriteCloser, datagramSender util.SSH3DatagramSenderFunc, channelCloseListener channelCloseListener, sendHeader bool, confirmSent bool,
 	confirmReceived bool, datagramsQueueSize uint64, additonalHeaderBytes []byte) Channel {
 	var header []byte = nil

@@ -61,6 +61,16 @@ func (e NoSuitableIdentity) Error() string {
 	return "no suitable identity found"
 }
 
+func dropOversizedDatagram(err error) bool {
+	var tooLarge *quic.DatagramTooLargeError
+	if !errors.As(err, &tooLarge) {
+		return false
+	}
+	log.Warn().Int64("max_datagram_payload_size", tooLarge.MaxDatagramPayloadSize).
+		Msg("dropping oversized UDP datagram while QUIC path MTU converges")
+	return true
+}
+
 func forwardAgent(parent context.Context, channel ssh3.Channel) error {
 	sockPath := os.Getenv("SSH_AUTH_SOCK")
 	if sockPath == "" {
@@ -341,6 +351,9 @@ func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, co
 			}
 			err = channel.SendDatagram(buf[:n])
 			if err != nil {
+				if dropOversizedDatagram(err) {
+					continue
+				}
 				log.Error().Msgf("could send datagram on channel: %s", err)
 				return
 			}
@@ -349,7 +362,7 @@ func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, co
 }
 
 type Client struct {
-	qconn quic.EarlyConnection
+	qconn *quic.Conn
 	*ssh3.Conversation
 
 	// reverseDispatcher centralises the handling of all server-initiated
@@ -532,8 +545,8 @@ func (d *reverseDispatcher) dispatch(channel ssh3.Channel) {
 	}
 }
 
-func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyConnection,
-	roundTripper *http3.RoundTripper,
+func Dial(ctx context.Context, config *client_config.Config, qconn *quic.Conn,
+	roundTripper *http3.Transport,
 	sshAgent agent.ExtendedAgent) (*Client, error) {
 
 	hostUrl := url.URL{}
@@ -566,7 +579,7 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 	}
 
 	// dirty hack: ensure only one QUIC connection is used
-	roundTripper.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+	roundTripper.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 		return qconn, nil
 	}
 
@@ -706,7 +719,17 @@ func Dial(ctx context.Context, config *client_config.Config, qconn quic.EarlyCon
 	}
 
 	log.Debug().Msgf("establish conversation with the server")
-	err = conv.EstablishClientConversation(req, roundTripper, ssh3.AVAILABLE_CLIENT_VERSIONS)
+	rawClient := roundTripper.NewRawClientConn(qconn)
+	go func() {
+		for {
+			stream, err := qconn.AcceptUniStream(qconn.Context())
+			if err != nil {
+				return
+			}
+			go rawClient.HandleUnidirectionalStream(stream)
+		}
+	}()
+	err = conv.EstablishClientConversation(req, rawClient, qconn, ssh3.AVAILABLE_CLIENT_VERSIONS)
 	if errors.Is(err, util.Unauthorized{}) {
 		log.Error().Msgf("Access denied from the server: unauthorized")
 		return nil, err
@@ -951,6 +974,9 @@ func (c *Client) ForwardUDP(ctx context.Context, localUDPAddr *net.UDPAddr, remo
 			}
 			err = channel.SendDatagram(buf[:n])
 			if err != nil {
+				if dropOversizedDatagram(err) {
+					continue
+				}
 				log.Error().Msgf("could not send datagram: %s", err)
 				return
 			}

@@ -14,7 +14,7 @@
 #      ECDSATESTUSER_USERNAME if you want a separate one.
 #   6. Wires the three testuser pubkeys into TESTUSER's
 #      ~/.ssh3/authorized_identities so the server accepts them.
-#   7. Runs `make integration-tests` with the right env vars under sudo
+#   7. Runs the pinned Ginkgo module with the right env vars under sudo
 #      (the ssh3-server needs root to setuid into TESTUSER).
 #   8. On exit, removes the temp work directory.  System users created
 #      here are NOT removed automatically - see the "Cleanup" section at
@@ -27,11 +27,11 @@ set -euo pipefail
 
 # ---- defaults (override via environment) ------------------------------------
 
-: "${TESTUSER_USERNAME:=ssh3-itest-user}"
+: "${TESTUSER_USERNAME:=11111111111111111111111111111111}"
 : "${TESTUSER_HOME:=/home/${TESTUSER_USERNAME}}"
 : "${ECDSATESTUSER_USERNAME:=${TESTUSER_USERNAME}}"
 : "${ECDSATESTUSER_HOME:=/home/${ECDSATESTUSER_USERNAME}}"
-: "${ATTACKER_USERNAME:=ssh3-itest-attacker}"
+: "${ATTACKER_USERNAME:=22222222222222222222222222222222}"
 : "${ATTACKER_HOME:=/home/${ATTACKER_USERNAME}}"
 : "${WORK_DIR:=$(mktemp -d -t ssh3-itest.XXXXXXXX)}"
 : "${KEEP_WORK_DIR:=0}"      # set to 1 to keep the temp dir after the run
@@ -56,7 +56,11 @@ ensure_user() {
         log "user $user already exists, reusing"
     else
         log "creating user $user (home $home)"
-        sudo useradd --create-home --home-dir "$home" --shell /bin/bash "$user"
+        local useradd_args=(--create-home --home-dir "$home" --shell /bin/bash)
+        if [[ "$user" =~ ^[0-9a-f]{32}$ ]]; then
+            useradd_args+=(--badname)
+        fi
+        sudo useradd "${useradd_args[@]}" "$user"
     fi
     # Force-fix the home dir owner in case useradd skipped the chown step
     # (e.g. when -m was suppressed by a previous failed run).
@@ -70,7 +74,6 @@ require openssl
 require ssh-keygen
 require sudo
 require go
-require make
 
 log "repo root:   $REPO_ROOT"
 log "work dir:    $WORK_DIR"
@@ -199,9 +202,10 @@ sudo \
     TESTUSER_ECDSA_PRIVKEY="$TESTUSER_ECDSA_PRIVKEY" \
     ATTACKER_PRIVKEY="$ATTACKER_PRIVKEY" \
     SSH3_INTEGRATION_TESTS_WITH_SERVER_ENABLED=1 \
+    SSH3_INTEGRATION_TESTS_CURRENT_ONLY="${SSH3_INTEGRATION_TESTS_CURRENT_ONLY:-0}" \
     CGO_ENABLED=1 \
     GOOS="${GOOS:-linux}" \
     GO111MODULE=on \
     PATH="$PATH" \
     HOME="$HOME" \
-    go run github.com/onsi/ginkgo/v2/ginkgo $GINKGO_EXTRA_ARGS ./integration_tests
+    go run github.com/onsi/ginkgo/v2/ginkgo@v2.13.0 $GINKGO_EXTRA_ARGS ./integration_tests
