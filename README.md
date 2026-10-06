@@ -274,6 +274,13 @@ only the exact `active`/`next` certificates: it does not use system roots,
 `-cmxsafe-proxy-gateway-trust` manifest so proxy and destination trust cannot
 be mixed. The bundle contains no gateway private key.
 
+CMXsafe releases are published only from `cmxsafe-v*` tags. Each prerelease
+contains reproducible Linux `amd64` and `arm64` bundles, SHA-256 checksums, an
+SPDX SBOM, a `cmxsafe-component.json` capability manifest, a keyless Sigstore
+bundle for `SHA256SUMS`, and GitHub build provenance. The dashboard must pin an
+approved artifact digest; it must not download a mutable branch or build SSH3
+at runtime.
+
 > [!NOTE]
 > Similarly to OpenSSH, the server must be run with root priviledges to log in as other users.
 
