@@ -4,6 +4,7 @@ BUILDFLAGS ?=-ldflags "-X main.version=$(shell git describe --tags --always --di
 GO_OPTS?=CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS)
 GO_TAGS?=
 TEST_OPTS?=GOOS=$(GOOS) GOARCH=$(GOARCH)
+GOVULNCHECK_VERSION ?= v1.7.0
 
 lint:
 	go fmt ./...
@@ -13,6 +14,9 @@ lint:
 test:
 	$(TEST_OPTS) go test ./...
 	$(TEST_OPTS) go run github.com/onsi/ginkgo/v2/ginkgo -r
+
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 integration-tests:
 	CERT_PEM=$(CERT_PEM) \

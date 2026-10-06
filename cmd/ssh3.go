@@ -50,7 +50,7 @@ func homedir() string {
 // If non-nil, use udpConn as transport (can be used for proxy jump)
 // Otherwise, create a UDPConn from udp://host:port
 func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog io.Writer, ssh3Dir string, certPool *x509.CertPool, knownHostsPath string, knownHosts ssh3.KnownHosts,
-	oidcConfig []*oidc.OIDCConfig, options *client_config.Config, proxyRemoteAddr *net.UDPAddr, tty *os.File) (quic.EarlyConnection, int) {
+	oidcConfig []*oidc.OIDCConfig, options *client_config.Config, proxyRemoteAddr *net.UDPAddr, tty *os.File) (*quic.Conn, int) {
 
 	var err error
 	remoteAddr := proxyRemoteAddr
@@ -101,6 +101,13 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 	qconf.Allow0RTT = false
 	qconf.EnableDatagrams = true
 	qconf.KeepAlivePeriod = 1 * time.Second
+	if proxyRemoteAddr != nil {
+		// The inner QUIC connection is carried in SSH3 datagrams. Start at the
+		// QUIC minimum so the outer connection has room for its HTTP/3 context
+		// and SSH3 channel identifiers while path MTU discovery converges.
+		qconf.InitialPacketSize = 1200
+		qconf.DisablePathMTUDiscovery = true
+	}
 
 	if certs, ok := knownHosts[options.CanonicalHostFormat()]; ok {
 		foundSelfsignedSSH3 := false
@@ -767,7 +774,7 @@ func ClientMain() int {
 			return status
 		}
 
-		roundTripper := &http3.RoundTripper{
+		roundTripper := &http3.Transport{
 			EnableDatagrams: true,
 		}
 
@@ -805,7 +812,7 @@ func ClientMain() int {
 		return status
 	}
 
-	roundTripper := &http3.RoundTripper{
+	roundTripper := &http3.Transport{
 		EnableDatagrams: true,
 	}
 

@@ -36,6 +36,16 @@ import (
 	"github.com/francoismichel/ssh3/util/unix_util"
 )
 
+func dropOversizedDatagram(err error) bool {
+	var tooLarge *quic.DatagramTooLargeError
+	if !errors.As(err, &tooLarge) {
+		return false
+	}
+	log.Warn().Int64("max_datagram_payload_size", tooLarge.MaxDatagramPayloadSize).
+		Msg("dropping oversized UDP datagram while QUIC path MTU converges")
+	return true
+}
+
 var signals = map[string]os.Signal{
 	"SIGABRT":   syscall.Signal(0x6),
 	"SIGALRM":   syscall.Signal(0xe),
@@ -166,6 +176,9 @@ func forwardUDPInBackground(ctx context.Context, channel ssh3.Channel, conn *net
 			}
 			err = channel.SendDatagram(buf[:n])
 			if err != nil {
+				if dropOversizedDatagram(err) {
+					continue
+				}
 				log.Error().Msgf("could send datagram on channel: %s", err)
 				return
 			}
@@ -762,6 +775,9 @@ func handleUDPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 
 			err = channel.SendDatagram(buf[:n])
 			if err != nil {
+				if dropOversizedDatagram(err) {
+					continue
+				}
 				log.Error().Msgf("could not send datagram: %s", err)
 				return
 			}
@@ -859,6 +875,7 @@ func openAgentSocketAndForwardAgent(parent context.Context, conv *ssh3.Conversat
 	ctx, cancel := context.WithCancelCause(parent)
 	sockPath, err := unix_util.NewUnixSocketPath()
 	if err != nil {
+		cancel(err)
 		return "", err
 	}
 
@@ -866,6 +883,7 @@ func openAgentSocketAndForwardAgent(parent context.Context, conv *ssh3.Conversat
 	agentSock, err := listener.Listen(ctx, "unix", sockPath)
 	if err != nil {
 		log.Error().Msgf("could not listen on agent socket: %s", err.Error())
+		cancel(err)
 		return "", err
 	}
 
@@ -873,11 +891,13 @@ func openAgentSocketAndForwardAgent(parent context.Context, conv *ssh3.Conversat
 	err = os.Chown(sockDir, int(user.Uid), int(user.Gid))
 	if err != nil {
 		log.Error().Msgf("could chown the directory of the listening socket at %s: %s", sockPath, err.Error())
+		cancel(err)
 		return "", err
 	}
 	err = os.Chown(sockPath, int(user.Uid), int(user.Gid))
 	if err != nil {
 		log.Error().Msgf("could chown the listening socket at %s: %s", sockPath, err.Error())
+		cancel(err)
 		return "", err
 	}
 
@@ -1059,7 +1079,7 @@ func ServerMain() int {
 	server := http3.Server{
 		Handler:         nil,
 		Addr:            *bindAddr,
-		QuicConfig:      quicConf,
+		QUICConfig:      quicConf,
 		EnableDatagrams: true,
 		TLSConfig:       tlsConfig,
 	}
@@ -1078,13 +1098,23 @@ func ServerMain() int {
 
 			switch c := channel.(type) {
 			case *ssh3.UDPForwardingChannelImpl:
-				handleUDPForwardingChannel(conv.Context(), authenticatedUser, conv, c)
+				if err := handleUDPForwardingChannel(conv.Context(), authenticatedUser, conv, c); err != nil {
+					log.Error().Err(err).Uint64("channel_id", uint64(c.ChannelID())).Msg("handle UDP forwarding channel")
+					c.Close()
+				}
 			case *ssh3.TCPForwardingChannelImpl:
-				handleTCPForwardingChannel(conv.Context(), authenticatedUser, conv, c)
+				if err := handleTCPForwardingChannel(conv.Context(), authenticatedUser, conv, c); err != nil {
+					log.Error().Err(err).Uint64("channel_id", uint64(c.ChannelID())).Msg("handle TCP forwarding channel")
+					c.Close()
+				}
 			case *ssh3.TCPReverseForwardingChannelImpl:
-				handleTCPReverseForwardingChannel(conv.Context(), authenticatedUser, conv, c)
+				if err := handleTCPReverseForwardingChannel(conv.Context(), authenticatedUser, conv, c); err != nil {
+					log.Error().Err(err).Uint64("channel_id", uint64(c.ChannelID())).Msg("handle reverse TCP forwarding channel")
+				}
 			case *ssh3.UDPReverseForwardingChannelImpl:
-				handleUDPReverseForwardingChannel(conv.Context(), authenticatedUser, conv, c)
+				if err := handleUDPReverseForwardingChannel(conv.Context(), authenticatedUser, conv, c); err != nil {
+					log.Error().Err(err).Uint64("channel_id", uint64(c.ChannelID())).Msg("handle reverse UDP forwarding channel")
+				}
 			default:
 				runningSessions.Insert(channel, &runningSession{
 					channelState: LARVAL,
@@ -1163,7 +1193,7 @@ func ServerMain() int {
 	outputMessage := fmt.Sprintf("Server started, listening on %s%s", *bindAddr, *urlPath)
 	fmt.Fprintln(os.Stderr, outputMessage)
 	log.Info().Msg(outputMessage)
-	err = server.ListenAndServe()
+	err = ssh3Server.ListenAndServe(10)
 
 	if err != nil {
 		log.Error().Msgf("error while serving HTTP connection: %s", err)

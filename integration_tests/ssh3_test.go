@@ -84,6 +84,9 @@ var _ = BeforeSuite(func() {
 		serverSessions[serverBind] = session
 
 		for tag, bind := range oldServerBinds {
+			if os.Getenv("SSH3_INTEGRATION_TESTS_CURRENT_ONLY") == "1" {
+				continue
+			}
 			gobin, err := os.MkdirTemp("", fmt.Sprintf("ssh3-backwards-compatible-versions-%s", tag))
 			Expect(err).ToNot(HaveOccurred())
 			cmd := exec.Command("go", "install", fmt.Sprintf("github.com/francoismichel/ssh3/cmd/ssh3-server@%s", tag))
@@ -106,18 +109,20 @@ var _ = BeforeSuite(func() {
 			serverSessions[bind] = session
 		}
 
-		proxyServerCommand = exec.Command(ssh3ServerPath,
-			"-bind", proxyServerBind,
-			"-v",
-			"-enable-password-login",
-			"-url-path", DEFAULT_PROXY_URL_PATH,
-			"-cert", os.Getenv("CERT_PEM"),
-			"-key", os.Getenv("CERT_PRIV_KEY"))
-		proxyServerCommand.Env = append(proxyServerCommand.Env, "SSH3_LOG_LEVEL=debug")
-		proxyServerSession, err = Start(proxyServerCommand, GinkgoWriter, GinkgoWriter)
-		Expect(err).ToNot(HaveOccurred())
+		if os.Getenv("SSH3_INTEGRATION_TESTS_CURRENT_ONLY") != "1" {
+			proxyServerCommand = exec.Command(ssh3ServerPath,
+				"-bind", proxyServerBind,
+				"-v",
+				"-enable-password-login",
+				"-url-path", DEFAULT_PROXY_URL_PATH,
+				"-cert", os.Getenv("CERT_PEM"),
+				"-key", os.Getenv("CERT_PRIV_KEY"))
+			proxyServerCommand.Env = append(proxyServerCommand.Env, "SSH3_LOG_LEVEL=debug")
+			proxyServerSession, err = Start(proxyServerCommand, GinkgoWriter, GinkgoWriter)
+			Expect(err).ToNot(HaveOccurred())
 
-		serverSessions[proxyServerBind] = proxyServerSession
+			serverSessions[proxyServerBind] = proxyServerSession
+		}
 
 		rsaPrivKeyPath = os.Getenv("TESTUSER_PRIVKEY")
 		ed25519PrivKeyPath = os.Getenv("TESTUSER_ED25519_PRIVKEY")
@@ -176,7 +181,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			}
 
 			Context("Client behaviour", func() {
-				It("Should connect using an RSA privkey", func() {
+				It("Should connect using an RSA privkey", Label("cmxsafe-smoke"), func() {
 					clientArgs = append(getClientArgs(rsaPrivKeyPath), "echo", "Hello, World!")
 					command := exec.Command(ssh3Path, clientArgs...)
 					session, err := Start(command, GinkgoWriter, GinkgoWriter)
@@ -787,7 +792,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			})
 
 			Context("Server behaviour", func() {
-				It("Should not grand access to non-authorized identity", func() {
+				It("Should not grand access to non-authorized identity", Label("cmxsafe-smoke"), func() {
 					clientArgs = append(getClientArgs(attackerPrivKeyPath), "echo", "Hello, World!")
 
 					command := exec.Command(ssh3Path, clientArgs...)

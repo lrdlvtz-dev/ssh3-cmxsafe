@@ -14,15 +14,15 @@ concurrency:
 
 jobs:
   verify:
-    name: Format, test, race and build
+    name: Format, vulnerability scan, test and race
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -33,6 +33,12 @@ jobs:
           gofmt -w $(git ls-files '*.go')
           git diff --exit-code
 
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Check reachable vulnerabilities
+        run: govulncheck ./...
+
       - name: Unit and integration tests
         run: go test ./...
 
@@ -41,3 +47,49 @@ jobs:
 
       - name: Build Linux client and server
         run: go build ./cmd/ssh3 ./cmd/ssh3-server
+
+  cross-build:
+    name: Build Linux ${{ matrix.goarch }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build client and server
+        env:
+          CGO_ENABLED: "0"
+          GOARCH: ${{ matrix.goarch }}
+          GOOS: linux
+        run: go build -tags disable_password_auth ./cmd/ssh3 ./cmd/ssh3-server
+
+  current-transport-e2e:
+    name: Current SSH3 authentication E2E
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify authorized and unauthorized authentication
+        env:
+          GINKGO_EXTRA_ARGS: --label-filter=cmxsafe-smoke
+          KEEP_USERS: "0"
+          SSH3_INTEGRATION_TESTS_CURRENT_ONLY: "1"
+        run: ./scripts/run_integration_tests.sh

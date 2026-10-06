@@ -11,7 +11,6 @@ import (
 	"github.com/francoismichel/ssh3"
 	"github.com/francoismichel/ssh3/util/unix_util"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/rs/zerolog/log"
 )
@@ -27,7 +26,11 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 		log.Debug().Msgf("peer version: protocol version %s, software version %s", peerVersion.GetProtocolVersion(), peerVersion.GetSoftwareVersion())
 		// currently apply strict version rules
 		if err != nil {
-			http.Error(w, fmt.Sprintf("Unsupported user-agent: %s", r.UserAgent()[:100]), http.StatusForbidden)
+			userAgent := r.UserAgent()
+			if len(userAgent) > 100 {
+				userAgent = userAgent[:100]
+			}
+			http.Error(w, fmt.Sprintf("Unsupported user-agent: %s", userAgent), http.StatusForbidden)
 			return
 		}
 		if !ssh3.IsVersionSupported(peerVersion) {
@@ -37,30 +40,43 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 		// Only call Flush() here, as calling flush prevents from adding the Content-Length header to the response
 		// The Content-Length can be useful upon receiving an error response
 		defer w.(http.Flusher).Flush()
-		hijacker, ok := w.(http3.Hijacker)
-		if !ok { // should never happen, unless quic-go change their API
-			log.Error().Msgf("failed to hijack")
+		httpStreamer, ok := w.(http3.HTTPStreamer)
+		if !ok {
+			log.Error().Msgf("failed to take over HTTP/3 stream")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		streamCreator := hijacker.StreamCreator()
-		qconn := streamCreator.(quic.Connection)
+		qconn, ok := ssh3.ConnectionFromContext(r.Context())
+		if !ok {
+			log.Error().Msgf("missing QUIC connection in request context")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		if !qconn.ConnectionState().TLS.HandshakeComplete {
 			// do not process early data (0-RTT) when performing authorization
 			// to avoid replay attacks
 			w.WriteHeader(http.StatusTooEarly)
 			return
 		}
-		str := r.Body.(http3.HTTPStreamer).HTTPStream()
-		conv, err := ssh3.NewServerConversation(ctx, str, qconn, qconn, defaultMaxPacketSize, peerVersion)
+		tlsState := qconn.ConnectionState().TLS
+		convID, err := ssh3.GenerateConversationID(&tlsState)
 		if err != nil {
-			log.Error().Msgf("could not create new server conversation")
+			log.Error().Msgf("could not generate conversation ID")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		convID := conv.ConversationID()
 		base64ConvID := base64.StdEncoding.EncodeToString(convID[:])
+		finishAuthentication := func(username string, _ *ssh3.Conversation, responseWriter http.ResponseWriter, request *http.Request) {
+			conversation, err := ssh3.NewServerConversation(ctx, nil, qconn, nil, defaultMaxPacketSize, peerVersion)
+			if err != nil {
+				log.Error().Err(err).Msg("could not create authenticated server conversation")
+				responseWriter.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			conversation.AttachServerControlStream(httpStreamer.HTTPStream())
+			handlerFunc(username, conversation, responseWriter, request)
+		}
 
 		username := r.URL.User.Username()
 		if username == "" {
@@ -84,7 +100,7 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 			case *WrappedPluginVerifier:
 				if verifier.Verify(r, base64ConvID) {
 					log.Debug().Msgf("request for user %s successfully verified by plugin", username)
-					handlerFunc(username, conv, w, r)
+					finishAuthentication(username, nil, w, r)
 					return
 				}
 			}
@@ -94,9 +110,9 @@ func HandleAuths(ctx context.Context, enablePasswordLogin bool, defaultMaxPacket
 
 		authorization := r.Header.Get("Authorization")
 		if enablePasswordLogin && strings.HasPrefix(authorization, "Basic ") {
-			HandleBasicAuth(handlerFunc, conv)(w, r)
+			HandleBasicAuth(finishAuthentication, nil)(w, r)
 		} else if strings.HasPrefix(authorization, "Bearer ") {
-			HandleBearerAuth(username, base64ConvID, HandleJWTAuth(username, conv, identityVerifiers, handlerFunc))(w, r)
+			HandleBearerAuth(username, base64ConvID, HandleJWTAuth(username, nil, identityVerifiers, finishAuthentication))(w, r)
 		} else {
 			w.WriteHeader(http.StatusUnauthorized)
 		}
