@@ -46,8 +46,17 @@ type Conversation struct {
 	cancelContext             context.CancelCauseFunc
 	conversationID            ConversationID // generated using TLS exporters
 	peerVersion               Version
+	authorizationPolicy       AuthorizationPolicy
 
 	channelsAcceptQueue *util.AcceptQueue[Channel]
+}
+
+func (c *Conversation) SetAuthorizationPolicy(policy AuthorizationPolicy) {
+	c.authorizationPolicy = policy
+}
+
+func (c *Conversation) AuthorizationPolicy() AuthorizationPolicy {
+	return c.authorizationPolicy
 }
 
 func GenerateConversationID(tls *tls.ConnectionState) (convID ConversationID, err error) {

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -469,7 +470,10 @@ func execCmdInBackground(channel ssh3.Channel, openPty *openPty, user *unix_util
 	return nil
 }
 
-func newPtyReq(user *unix_util.User, channel ssh3.Channel, request ssh3Messages.PtyRequest, wantReply bool) error {
+func newPtyReq(user *unix_util.User, policy ssh3.AuthorizationPolicy, channel ssh3.Channel, request ssh3Messages.PtyRequest, wantReply bool) error {
+	if policy.NoPTY {
+		return fmt.Errorf("PTY denied by authenticated identity policy")
+	}
 	var session *runningSession
 	session, ok := runningSessions.Get(channel)
 	if !ok {
@@ -505,7 +509,10 @@ func newX11Req(user *unix_util.User, channel ssh3.Channel, request ssh3Messages.
 	return fmt.Errorf("%T not implemented", request)
 }
 
-func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, command string, args ...string) error {
+func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, originalCommand *string, command string, args ...string) error {
+	if originalCommand != nil && strings.IndexByte(*originalCommand, 0) >= 0 {
+		return fmt.Errorf("original command contains NUL")
+	}
 	var session *runningSession
 	session, ok := runningSessions.Get(channel)
 	if !ok {
@@ -554,6 +561,9 @@ func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, com
 	if err != nil {
 		return err
 	}
+	if originalCommand != nil {
+		cmd.Env = append(cmd.Env, "SSH_ORIGINAL_COMMAND="+*originalCommand)
+	}
 
 	runningCommand := &runningCommand{
 		Cmd:     *cmd,
@@ -569,13 +579,20 @@ func newCommand(user *unix_util.User, channel ssh3.Channel, loginShell bool, com
 	return execCmdInBackground(channel, session.pty, user, session.runningCmd, session.authAgentSocketPath)
 }
 
-func newShellReq(user *unix_util.User, channel ssh3.Channel, wantReply bool) error {
-	return newCommand(user, channel, true, user.Shell)
+func newShellReq(user *unix_util.User, policy ssh3.AuthorizationPolicy, channel ssh3.Channel, wantReply bool) error {
+	if policy.HasForceCommand {
+		originalCommand := ""
+		return newCommand(user, channel, false, &originalCommand, user.Shell, "-c", policy.ForceCommand)
+	}
+	return newCommand(user, channel, true, nil, user.Shell)
 }
 
 // similar behaviour to OpenSSH; exec requests are just pasted in the user's shell
-func newCommandInShellReq(user *unix_util.User, channel ssh3.Channel, wantReply bool, command string) error {
-	return newCommand(user, channel, false, user.Shell, "-c", command)
+func newCommandInShellReq(user *unix_util.User, policy ssh3.AuthorizationPolicy, channel ssh3.Channel, wantReply bool, command string) error {
+	if policy.HasForceCommand {
+		return newCommand(user, channel, false, &command, user.Shell, "-c", policy.ForceCommand)
+	}
+	return newCommand(user, channel, false, nil, user.Shell, "-c", command)
 }
 
 func newSubsystemReq(user *unix_util.User, channel ssh3.Channel, request ssh3Messages.SubsystemRequest, wantReply bool) error {
@@ -621,6 +638,9 @@ func newExitSignalReq(user *unix_util.User, channel ssh3.Channel, request ssh3Me
 }
 
 func handleUDPForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.UDPForwardingChannelImpl) error {
+	if !conv.AuthorizationPolicy().CanOpen(channel.RemoteAddr.IP, channel.RemoteAddr.Port) {
+		return fmt.Errorf("UDP forwarding to %s denied by authenticated identity policy", channel.RemoteAddr)
+	}
 	if user.Uid > uint64(^uint32(0)) {
 		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
 	}
@@ -633,6 +653,9 @@ func handleUDPForwardingChannel(ctx context.Context, user *unix_util.User, conv 
 }
 
 func handleTCPForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.TCPForwardingChannelImpl) error {
+	if !conv.AuthorizationPolicy().CanOpen(channel.RemoteAddr.IP, channel.RemoteAddr.Port) {
+		return fmt.Errorf("TCP forwarding to %s denied by authenticated identity policy", channel.RemoteAddr)
+	}
 	if user.Uid > uint64(^uint32(0)) {
 		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
 	}
@@ -665,6 +688,12 @@ func writeReverseSetupAck(channel ssh3.Channel, status byte, reason string) erro
 
 // Copied from client.go ForwardTCP()
 func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.TCPReverseForwardingChannelImpl) error {
+	if !conv.AuthorizationPolicy().CanListen(channel.LocalAddr.IP, channel.LocalAddr.Port) {
+		err := fmt.Errorf("reverse TCP listener %s denied by authenticated identity policy", channel.LocalAddr)
+		_ = writeReverseSetupAck(channel, ssh3.ReverseSetupAckFail, err.Error())
+		channel.Close()
+		return err
+	}
 	if user.Uid > uint64(^uint32(0)) {
 		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
 	}
@@ -717,6 +746,12 @@ func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 }
 
 func handleUDPReverseForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, ch *ssh3.UDPReverseForwardingChannelImpl) error {
+	if !conv.AuthorizationPolicy().CanListen(ch.LocalAddr.IP, ch.LocalAddr.Port) {
+		err := fmt.Errorf("reverse UDP listener %s denied by authenticated identity policy", ch.LocalAddr)
+		_ = writeReverseSetupAck(ch, ssh3.ReverseSetupAckFail, err.Error())
+		ch.Close()
+		return err
+	}
 	if user.Uid > uint64(^uint32(0)) {
 		return fmt.Errorf("authenticated uid %d exceeds helper protocol", user.Uid)
 	}
@@ -1090,6 +1125,10 @@ func ServerMain() int {
 		if err != nil {
 			return err
 		}
+		authorizationPolicy := conv.AuthorizationPolicy()
+		if !authorizationPolicy.Initialized {
+			return fmt.Errorf("authenticated conversation has no authorization policy")
+		}
 		for {
 			channel, err := conv.AcceptChannel(conv.Context())
 			if err != nil {
@@ -1141,13 +1180,13 @@ func ServerMain() int {
 						case *ssh3Messages.ChannelRequestMessage:
 							switch requestMessage := message.ChannelRequest.(type) {
 							case *ssh3Messages.PtyRequest:
-								err = newPtyReq(authenticatedUser, channel, *requestMessage, message.WantReply)
+								err = newPtyReq(authenticatedUser, authorizationPolicy, channel, *requestMessage, message.WantReply)
 							case *ssh3Messages.X11Request:
 								err = newX11Req(authenticatedUser, channel, *requestMessage, message.WantReply)
 							case *ssh3Messages.ShellRequest:
-								err = newShellReq(authenticatedUser, channel, message.WantReply)
+								err = newShellReq(authenticatedUser, authorizationPolicy, channel, message.WantReply)
 							case *ssh3Messages.ExecRequest:
-								err = newCommandInShellReq(authenticatedUser, channel, message.WantReply, requestMessage.Command)
+								err = newCommandInShellReq(authenticatedUser, authorizationPolicy, channel, message.WantReply, requestMessage.Command)
 							case *ssh3Messages.SubsystemRequest:
 								err = newSubsystemReq(authenticatedUser, channel, *requestMessage, message.WantReply)
 							case *ssh3Messages.WindowChangeRequest:
@@ -1163,7 +1202,11 @@ func ServerMain() int {
 							runningSession, ok := runningSessions.Get(channel)
 							if ok && runningSession.channelState == LARVAL {
 								if message.Data == string("forward-agent") {
-									runningSession.authAgentSocketPath, err = openAgentSocketAndForwardAgent(conv.Context(), conv, authenticatedUser)
+									if authorizationPolicy.NoAgentForwarding {
+										err = fmt.Errorf("agent forwarding denied by authenticated identity policy")
+									} else {
+										runningSession.authAgentSocketPath, err = openAgentSocketAndForwardAgent(conv.Context(), conv, authenticatedUser)
+									}
 								} else {
 									// invalid data on larval state
 									err = fmt.Errorf("invalid data on ssh channel with LARVAL state")

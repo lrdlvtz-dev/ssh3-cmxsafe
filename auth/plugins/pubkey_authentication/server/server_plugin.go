@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
+	ssh3 "github.com/francoismichel/ssh3"
 	"github.com/francoismichel/ssh3/auth"
 	"github.com/francoismichel/ssh3/auth/plugins"
 	"github.com/francoismichel/ssh3/server_auth"
@@ -26,6 +27,16 @@ func init() {
 type PubkeyJWTIdentityVerifier struct {
 	username string
 	pubkey   crypto.PublicKey
+	policy   ssh3.AuthorizationPolicy
+	keyID    string
+}
+
+func (v *PubkeyJWTIdentityVerifier) AuthorizationPolicy() ssh3.AuthorizationPolicy {
+	return v.policy
+}
+
+func (v *PubkeyJWTIdentityVerifier) CredentialID() string {
+	return v.keyID
 }
 
 func (v *PubkeyJWTIdentityVerifier) Verify(request *http.Request, base64ConversationID string) bool {
@@ -73,7 +84,7 @@ func (v *PubkeyJWTIdentityVerifier) Verify(request *http.Request, base64Conversa
 
 func PubkeyAuthPlugin(username string, identityStr string) (auth.RequestIdentityVerifier, error) {
 	log.Debug().Msgf("pubkey auth plugin: parse identity string")
-	pubkey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(identityStr))
+	pubkey, _, options, _, err := ssh.ParseAuthorizedKey([]byte(identityStr))
 	// we should not return an error when the format does not match a public key, we should just return a nil RequestIdentityVerifier
 	if err != nil {
 		log.Debug().Msgf("the identity string is not a compatible pubkey string")
@@ -83,11 +94,17 @@ func PubkeyAuthPlugin(username string, identityStr string) (auth.RequestIdentity
 	log.Debug().Msg("parsing ssh authorized key")
 	switch pubkey.Type() {
 	case "ssh-rsa", "ecdsa-sha2-nistp256", "ssh-ed25519":
+		policy, err := server_auth.ParseAuthorizedKeyOptions(options)
+		if err != nil {
+			return nil, fmt.Errorf("invalid authorized key restrictions: %w", err)
+		}
 		log.Debug().Msgf("parsing %s identity", pubkey.Type())
 		cryptoPublicKey := pubkey.(ssh.CryptoPublicKey)
 		return &PubkeyJWTIdentityVerifier{
 			pubkey:   cryptoPublicKey.CryptoPublicKey(),
 			username: username,
+			policy:   policy,
+			keyID:    ssh.FingerprintSHA256(pubkey),
 		}, nil
 
 	default:
