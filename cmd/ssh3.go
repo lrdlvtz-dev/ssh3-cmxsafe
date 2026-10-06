@@ -49,7 +49,7 @@ func homedir() string {
 // Prepares the QUIC connection that will be used by SSH3
 // If non-nil, use udpConn as transport (can be used for proxy jump)
 // Otherwise, create a UDPConn from udp://host:port
-func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog io.Writer, ssh3Dir string, certPool *x509.CertPool, knownHostsPath string, knownHosts ssh3.KnownHosts,
+func setupQUICConnection(ctx context.Context, skipHostVerification bool, gatewayTrust *gatewayTrustBundle, keylog io.Writer, ssh3Dir string, certPool *x509.CertPool, knownHostsPath string, knownHosts ssh3.KnownHosts,
 	oidcConfig []*oidc.OIDCConfig, options *client_config.Config, proxyRemoteAddr *net.UDPAddr, tty *os.File) (*quic.Conn, int) {
 
 	var err error
@@ -93,6 +93,9 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 		KeyLogWriter:       keylog,
 		ServerName:         options.Hostname(),
 	}
+	if gatewayTrust != nil {
+		tlsConf = gatewayTrust.tlsConfig(keylog)
+	}
 
 	var qconf quic.Config
 
@@ -109,22 +112,24 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 		qconf.DisablePathMTUDiscovery = true
 	}
 
-	if certs, ok := knownHosts[options.CanonicalHostFormat()]; ok {
-		foundSelfsignedSSH3 := false
+	if gatewayTrust == nil {
+		if certs, ok := knownHosts[options.CanonicalHostFormat()]; ok {
+			foundSelfsignedSSH3 := false
 
-		for _, cert := range certs {
-			certPool.AddCert(cert)
-			if cert.VerifyHostname("selfsigned.ssh3") == nil {
-				foundSelfsignedSSH3 = true
+			for _, cert := range certs {
+				certPool.AddCert(cert)
+				if cert.VerifyHostname("selfsigned.ssh3") == nil {
+					foundSelfsignedSSH3 = true
+				}
 			}
-		}
 
-		// If no IP SAN was in the cert, then assume the self-signed cert at least matches the .ssh3 TLD
-		if foundSelfsignedSSH3 {
-			// Put "ssh3" as ServerName so that the TLS verification can succeed
-			// Otherwise, TLS refuses to validate a certificate without IP SANs
-			// if the hostname is an IP address.
-			tlsConf.ServerName = "selfsigned.ssh3"
+			// If no IP SAN was in the cert, then assume the self-signed cert at least matches the .ssh3 TLD
+			if foundSelfsignedSSH3 {
+				// Put "ssh3" as ServerName so that the TLS verification can succeed
+				// Otherwise, TLS refuses to validate a certificate without IP SANs
+				// if the hostname is an IP address.
+				tlsConf.ServerName = "selfsigned.ssh3"
+			}
 		}
 	}
 
@@ -135,6 +140,10 @@ func setupQUICConnection(ctx context.Context, skipHostVerification bool, keylog 
 		tlsConf,
 		&qconf)
 	if err != nil {
+		if gatewayTrust != nil {
+			log.Error().Msgf("gateway %q failed direct certificate verification: %s", gatewayTrust.GatewayID, err)
+			return nil, -1
+		}
 		if transportErr, ok := err.(*quic.TransportError); ok {
 			if transportErr.ErrorCode.IsCryptoError() {
 				log.Debug().Msgf("received QUIC crypto error on first connection attempt: %s", err)
@@ -520,6 +529,8 @@ func ClientMain() int {
 	keyLogFile := flag.String("keylog", "", "Write QUIC TLS keys and master secret in the specified keylog file: only for debugging purpose")
 	passwordAuthentication := flag.Bool("use-password", false, "if set, do classical password authentication")
 	insecure := flag.Bool("insecure", false, "if set, skip server certificate verification")
+	gatewayTrustManifest := flag.String("cmxsafe-gateway-trust", "", "CMXsafe direct gateway trust manifest (disables system roots, known_hosts and TOFU)")
+	proxyGatewayTrustManifest := flag.String("cmxsafe-proxy-gateway-trust", "", "CMXsafe direct gateway trust manifest for the proxy-jump gateway")
 	issuerUrl := flag.String("use-oidc", "", "if set, force the use of OpenID Connect with the specified issuer url as parameter (it opens a browser window)")
 	oidcConfigFileName := flag.String("oidc-config", "", "OpenID Connect json config file containing the \"client_id\" and \"client_secret\" fields needed for most identity providers")
 	verbose := flag.Bool("v", false, "if set, enable verbose mode")
@@ -551,6 +562,10 @@ func ClientMain() int {
 
 	flag.Parse()
 	args := flag.Args()
+	if *insecure && (*gatewayTrustManifest != "" || *proxyGatewayTrustManifest != "") {
+		log.Error().Msg("-insecure cannot be combined with CMXsafe direct gateway trust")
+		return -1
+	}
 
 	if *displayVersion {
 		fmt.Fprintln(os.Stdout, filepath.Base(os.Args[0]), "version", ssh3.GetCurrentSoftwareVersion())
@@ -600,9 +615,12 @@ func ClientMain() int {
 		log.Error().Msgf("there was an error when parsing known hosts: %s", err)
 	}
 
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
-	if err != nil {
-		tty = nil
+	var tty *os.File
+	if *gatewayTrustManifest == "" && *proxyGatewayTrustManifest == "" {
+		tty, err = os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		if err != nil {
+			tty = nil
+		}
 	}
 
 	urlFromParam := args[0]
@@ -694,6 +712,23 @@ func ClientMain() int {
 		keyLog = f
 	}
 
+	var gatewayTrust *gatewayTrustBundle
+	if *gatewayTrustManifest != "" {
+		gatewayTrust, err = loadGatewayTrustBundle(*gatewayTrustManifest, time.Now())
+		if err != nil {
+			log.Error().Msgf("could not load CMXsafe gateway trust: %s", err)
+			return -1
+		}
+	}
+	var proxyGatewayTrust *gatewayTrustBundle
+	if *proxyGatewayTrustManifest != "" {
+		proxyGatewayTrust, err = loadGatewayTrustBundle(*proxyGatewayTrustManifest, time.Now())
+		if err != nil {
+			log.Error().Msgf("could not load CMXsafe proxy gateway trust: %s", err)
+			return -1
+		}
+	}
+
 	var cliAuthMethods []interface{}
 	// Only do privkey and agent auth if OIDC is not asked explicitly
 	if !useOIDC {
@@ -749,6 +784,14 @@ func ClientMain() int {
 			return -1
 		}
 	}
+	if *proxyGatewayTrustManifest != "" && *proxyJump == "" {
+		log.Error().Msg("-cmxsafe-proxy-gateway-trust requires a proxy jump")
+		return -1
+	}
+	if *proxyJump != "" && ((*gatewayTrustManifest == "") != (*proxyGatewayTrustManifest == "")) {
+		log.Error().Msg("CMXsafe proxy jumps require separate direct-trust manifests for both proxy and destination")
+		return -1
+	}
 
 	var proxyAddress *net.UDPAddr
 	if *proxyJump != "" {
@@ -765,7 +808,7 @@ func ClientMain() int {
 			log.Error().Msgf("Could not get connection material for proxy %s: %s", proxyParsedUrl, err)
 			return -1
 		}
-		qconn, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, proxyOptions, nil, tty)
+		qconn, status := setupQUICConnection(ctx, *insecure, proxyGatewayTrust, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, proxyOptions, nil, tty)
 
 		if qconn == nil {
 			if status != 0 {
@@ -803,7 +846,7 @@ func ClientMain() int {
 		log.Debug().Msgf("started proxy jump at %s", proxyAddress)
 	}
 
-	qconn, status := setupQUICConnection(ctx, *insecure, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, options, proxyAddress, tty)
+	qconn, status := setupQUICConnection(ctx, *insecure, gatewayTrust, keyLog, ssh3Dir, pool, knownHostsPath, knownHosts, oidcConfig, options, proxyAddress, tty)
 
 	if qconn == nil {
 		if status != 0 {

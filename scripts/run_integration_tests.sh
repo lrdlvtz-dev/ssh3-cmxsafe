@@ -71,6 +71,7 @@ ensure_user() {
 # ---- start ------------------------------------------------------------------
 
 require openssl
+require sha256sum
 require ssh-keygen
 require sudo
 require go
@@ -129,7 +130,15 @@ openssl req -x509 -sha256 -nodes -newkey rsa:4096 \
     -keyout "$CERT_PRIV_KEY" -out "$CERT_PEM" -days 30 \
     -subj "/C=XX/O=ssh3-itest/CN=selfsigned.ssh3" \
     -addext "subjectAltName = DNS:selfsigned.ssh3,IP:127.0.0.1,IP:::1" \
+    -addext "basicConstraints = critical,CA:FALSE" \
+    -addext "extendedKeyUsage = serverAuth" \
     >/dev/null 2>&1
+
+CERT_SHA256="$(openssl x509 -in "$CERT_PEM" -outform DER | sha256sum | awk '{print $1}')"
+TRUST_MANIFEST="$WORK_DIR/gateway-trust.json"
+cat > "$TRUST_MANIFEST" <<EOF
+{"version":1,"gateway_id":"integration-gateway","server_name":"selfsigned.ssh3","certificates":[{"state":"active","certificate_file":"cert.pem","sha256":"$CERT_SHA256"}]}
+EOF
 
 # ---- 2. SSH key pairs -------------------------------------------------------
 
@@ -195,6 +204,7 @@ cd "$REPO_ROOT"
 sudo \
     CERT_PEM="$CERT_PEM" \
     CERT_PRIV_KEY="$CERT_PRIV_KEY" \
+    CMXSAFE_TRUST_MANIFEST="$TRUST_MANIFEST" \
     TESTUSER_USERNAME="$TESTUSER_USERNAME" \
     ECDSATESTUSER_USERNAME="$ECDSATESTUSER_USERNAME" \
     TESTUSER_PRIVKEY="$TESTUSER_PRIVKEY" \
