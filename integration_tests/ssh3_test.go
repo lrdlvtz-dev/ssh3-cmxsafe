@@ -77,6 +77,7 @@ var _ = BeforeSuite(func() {
 			"-v",
 			"-enable-password-login",
 			"-url-path", DEFAULT_URL_PATH,
+			"-cmxsafe-gateway-name", "selfsigned.ssh3",
 			"-cert", os.Getenv("CERT_PEM"),
 			"-key", os.Getenv("CERT_PRIV_KEY"))
 		serverCommand.Env = append(serverCommand.Env, "SSH3_LOG_LEVEL=debug")
@@ -842,6 +843,24 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					Eventually(session).ShouldNot(Exit(0))
 					Eventually(string(session.Wait().Err.Contents())).Should(ContainSubstring("unauthorized"))
 				})
+			})
+		})
+
+		Context("CMXsafe direct gateway trust", func() {
+			It("connects with the pinned gateway certificate without insecure or TOFU", Label("cmxsafe-smoke"), func() {
+				manifest := os.Getenv("CMXSAFE_TRUST_MANIFEST")
+				Expect(manifest).ToNot(BeEmpty())
+				command := exec.Command(ssh3Path,
+					"-v",
+					"-cmxsafe-gateway-trust", manifest,
+					"-privkey", rsaPrivKeyPath,
+					fmt.Sprintf("%s@%s%s", username, serverBind, DEFAULT_URL_PATH),
+					"echo", "CMXsafe direct trust",
+				)
+				session, err := Start(command, GinkgoWriter, GinkgoWriter)
+				Expect(err).ToNot(HaveOccurred())
+				Eventually(session).Should(Exit(0))
+				Eventually(session).Should(Say("CMXsafe direct trust\n"))
 			})
 		})
 	})

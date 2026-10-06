@@ -965,6 +965,7 @@ func ServerMain() int {
 		"that will be stored at the paths indicated by the -cert and -key args (they must not already exist)")
 	certPath := flag.String("cert", "./cert.pem", "the filename of the server certificate (or fullchain)")
 	keyPath := flag.String("key", "./priv.key", "the filename of the certificate private key")
+	cmxsafeGatewayName := flag.String("cmxsafe-gateway-name", "", "logical CMXsafe gateway name; enables strict direct-trust TLS mode")
 	var autogenCertificates autogenCertificates
 	flag.Var(&autogenCertificates, "generate-public-cert", "Automatically produce and use a valid public certificate using"+
 		"Let's Encrypt for the provided domain name. The flag can be used several times to generate several certificates."+
@@ -976,6 +977,10 @@ func ServerMain() int {
 		flag.BoolVar(&enablePasswordLogin, "enable-password-login", false, "if set, enable password authentication (disabled by default)")
 	}
 	flag.Parse()
+	if *cmxsafeGatewayName != "" && (*generateSelfSignedCert || len(autogenCertificates) != 0) {
+		fmt.Fprintln(os.Stderr, "CMXsafe gateway mode requires an explicitly provisioned -cert/-key pair and cannot generate certificates")
+		return -1
+	}
 
 	if *displayVersion {
 		fmt.Fprintln(os.Stdout, filepath.Base(os.Args[0]), "version", ssh3.GetCurrentSoftwareVersion())
@@ -1095,6 +1100,14 @@ func ServerMain() int {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Could not load -cert and -key pair: %s\n", err)
 			return -1
+		}
+		if *cmxsafeGatewayName != "" {
+			if err := validateGatewayServerKeyPair(certificate, *cmxsafeGatewayName, time.Now()); err != nil {
+				fmt.Fprintf(os.Stderr, "invalid CMXsafe gateway certificate: %s\n", err)
+				return -1
+			}
+			tlsConfig.MinVersion = tls.VersionTLS13
+			tlsConfig.MaxVersion = tls.VersionTLS13
 		}
 		tlsConfig.Certificates = append(tlsConfig.Certificates, certificate)
 	}

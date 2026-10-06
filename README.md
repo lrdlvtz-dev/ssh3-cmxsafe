@@ -232,6 +232,48 @@ If you have existing certificates and keys, you can run the server as follows to
 
     ssh3-server -cert /path/to/cert/or/fullchain -key /path/to/cert/private/key -url-path /ssh3
 
+#### CMXsafe direct gateway trust
+
+CMXsafe can trust a gateway certificate directly, without a public or private
+CA. Start every replica of one logical gateway with the same certificate and
+private key mounted read-only:
+
+    ssh3-server -cmxsafe-gateway-name gateway-a.cmxsafe \
+      -cert /run/cmxsafe/tls/cert.pem -key /run/cmxsafe/tls/key.pem
+
+Strict gateway mode requires TLS 1.3 and validates the certificate before
+binding: it must be a currently valid non-CA leaf, explicitly allow
+`ServerAuth`, and contain the exact logical gateway name as a SAN. Certificate
+autogeneration is rejected in this mode.
+
+The client consumes a versioned manifest next to the pinned PEM files:
+
+```json
+{
+  "version": 1,
+  "gateway_id": "gateway-a",
+  "server_name": "gateway-a.cmxsafe",
+  "certificates": [
+    {
+      "state": "active",
+      "certificate_file": "active.pem",
+      "sha256": "<SHA-256 of certificate DER>"
+    },
+    {
+      "state": "next",
+      "certificate_file": "next.pem",
+      "sha256": "<SHA-256 of certificate DER>"
+    }
+  ]
+}
+```
+
+Connect with `-cmxsafe-gateway-trust /path/to/manifest.json`. This mode uses
+only the exact `active`/`next` certificates: it does not use system roots,
+`known_hosts`, TOFU, or `-insecure`. Proxy jumps require a distinct
+`-cmxsafe-proxy-gateway-trust` manifest so proxy and destination trust cannot
+be mixed. The bundle contains no gateway private key.
+
 > [!NOTE]
 > Similarly to OpenSSH, the server must be run with root priviledges to log in as other users.
 
