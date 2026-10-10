@@ -246,6 +246,18 @@ binding: it must be a currently valid non-CA leaf, explicitly allow
 `ServerAuth`, and contain the exact logical gateway name as a SAN. Certificate
 autogeneration is rejected in this mode.
 
+Provision the dedicated long-lived Ed25519 certificate before starting the
+gateway (the command refuses to overwrite either destination):
+
+    ssh3-cmxsafe-cert -gateway-name gateway-a.cmxsafe \
+      -cert /run/cmxsafe/tls/cert.pem -key /run/cmxsafe/tls/key.pem
+
+The certificate is self-signed, valid for 1,000 years, and contains exactly
+the requested DNS name or IP address as its SAN. The command prints its
+SHA-256 DER fingerprint for the trust manifest and its UTC `not_after` value.
+The private key is written with mode `0600` and the certificate with `0644`.
+Normal certificate validity checks remain enabled on the server and client.
+
 The client consumes a versioned manifest next to the pinned PEM files:
 
 ```json
