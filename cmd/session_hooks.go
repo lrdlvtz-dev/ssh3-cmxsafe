@@ -20,6 +20,7 @@ import (
 const (
 	cmxsafeUsernameEnv  = "CMXSAFE_USERNAME"
 	cmxsafeSessionIDEnv = "CMXSAFE_SESSION_ID"
+	cmxsafeServerIDEnv  = "CMXSAFE_SERVER_ID"
 	cmxsafeSessionIDLen = 32
 )
 
@@ -31,19 +32,29 @@ type cmxsafeSessionHooks struct {
 	timeout   time.Duration
 	random    io.Reader
 	run       sessionHookCommand
+	serverID  string
 }
 
-func newCMXsafeSessionHooks(startPath, endPath string, timeout time.Duration) *cmxsafeSessionHooks {
+func newCMXsafeSessionHooks(startPath, endPath string, timeout time.Duration) (*cmxsafeSessionHooks, error) {
+	return newCMXsafeSessionHooksWithRandom(startPath, endPath, timeout, rand.Reader)
+}
+
+func newCMXsafeSessionHooksWithRandom(startPath, endPath string, timeout time.Duration, random io.Reader) (*cmxsafeSessionHooks, error) {
 	if startPath == "" && endPath == "" {
-		return nil
+		return nil, nil
+	}
+	serverID, err := newCMXsafeOpaqueID(random)
+	if err != nil {
+		return nil, errors.New("could not create CMXsafe server identifier")
 	}
 	return &cmxsafeSessionHooks{
 		startPath: startPath,
 		endPath:   endPath,
 		timeout:   timeout,
-		random:    rand.Reader,
+		random:    random,
 		run:       runSessionHookCommand,
-	}
+		serverID:  serverID,
+	}, nil
 }
 
 func runSessionHookCommand(ctx context.Context, path string, environment []string) error {
@@ -54,12 +65,13 @@ func runSessionHookCommand(ctx context.Context, path string, environment []strin
 	return command.Run()
 }
 
-func sessionHookEnvironment(username, sessionID string) []string {
+func sessionHookEnvironment(username, sessionID, serverID string) []string {
 	environment := os.Environ()
 	filtered := environment[:0]
 	for _, entry := range environment {
 		if strings.HasPrefix(entry, cmxsafeUsernameEnv+"=") ||
-			strings.HasPrefix(entry, cmxsafeSessionIDEnv+"=") {
+			strings.HasPrefix(entry, cmxsafeSessionIDEnv+"=") ||
+			strings.HasPrefix(entry, cmxsafeServerIDEnv+"=") {
 			continue
 		}
 		filtered = append(filtered, entry)
@@ -67,21 +79,30 @@ func sessionHookEnvironment(username, sessionID string) []string {
 	return append(filtered,
 		cmxsafeUsernameEnv+"="+username,
 		cmxsafeSessionIDEnv+"="+sessionID,
+		cmxsafeServerIDEnv+"="+serverID,
 	)
 }
 
-func (hooks *cmxsafeSessionHooks) newSessionID() (string, error) {
+func newCMXsafeOpaqueID(random io.Reader) (string, error) {
 	randomBytes := make([]byte, cmxsafeSessionIDLen)
-	if _, err := io.ReadFull(hooks.random, randomBytes); err != nil {
-		return "", errors.New("could not create CMXsafe session identifier")
+	if _, err := io.ReadFull(random, randomBytes); err != nil {
+		return "", err
 	}
 	return hex.EncodeToString(randomBytes), nil
+}
+
+func (hooks *cmxsafeSessionHooks) newSessionID() (string, error) {
+	sessionID, err := newCMXsafeOpaqueID(hooks.random)
+	if err != nil {
+		return "", errors.New("could not create CMXsafe session identifier")
+	}
+	return sessionID, nil
 }
 
 func (hooks *cmxsafeSessionHooks) execute(parent context.Context, path, username, sessionID string) error {
 	ctx, cancel := context.WithTimeout(parent, hooks.timeout)
 	defer cancel()
-	err := hooks.run(ctx, path, sessionHookEnvironment(username, sessionID))
+	err := hooks.run(ctx, path, sessionHookEnvironment(username, sessionID, hooks.serverID))
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}

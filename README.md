@@ -331,10 +331,13 @@ Its failure is logged without command output or hook environment values and
 does not replace the conversation result.
 
 Hooks are executed directly, without a shell or interpolated arguments. Both
-receive `CMXSAFE_USERNAME` and the same `CMXSAFE_SESSION_ID` in their
-environment. The session ID is 32 cryptographically random bytes encoded as
-lowercase hexadecimal and is suitable as an opaque lease identifier. Hook
-paths must be absolute. These flags are rejected unless
+receive `CMXSAFE_USERNAME`, the same `CMXSAFE_SESSION_ID`, and
+`CMXSAFE_SERVER_ID` in their environment. Both IDs are 32 cryptographically
+random bytes encoded as lowercase hexadecimal. The session ID is an opaque
+lease identifier unique to the conversation. The server ID is generated once
+when the hooks are configured, remains stable for the life of that server
+process, and changes after a restart. Failure to generate either ID fails
+closed. Hook paths must be absolute. These flags are rejected unless
 `-cmxsafe-gateway-name` enables strict CMXsafe mode; when they are omitted,
 server behavior is unchanged.
 

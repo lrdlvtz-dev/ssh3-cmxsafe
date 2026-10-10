@@ -1140,7 +1140,11 @@ func ServerMain() int {
 	}
 
 	mux := http.NewServeMux()
-	sessionHooks := newCMXsafeSessionHooks(*cmxsafeSessionStartHook, *cmxsafeSessionEndHook, *cmxsafeSessionHookTimeout)
+	sessionHooks, err := newCMXsafeSessionHooks(*cmxsafeSessionStartHook, *cmxsafeSessionEndHook, *cmxsafeSessionHookTimeout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return -1
+	}
 	ssh3Server := ssh3.NewServer(30000, 10, &server, func(authenticatedUsername string, conv *ssh3.Conversation) error {
 		authenticatedUser, err := unix_util.GetUser(authenticatedUsername)
 		if err != nil {
