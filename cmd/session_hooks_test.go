@@ -8,8 +8,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 )
+
+const testServerID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func hookEnvValue(environment []string, name string) string {
 	prefix := name + "="
@@ -30,9 +33,13 @@ func TestCMXsafeSessionHooksRunInLifecycleOrder(t *testing.T) {
 		endPath:   "/hooks/end",
 		timeout:   time.Second,
 		random:    bytes.NewReader(bytes.Repeat([]byte{0xa5}, cmxsafeSessionIDLen)),
+		serverID:  testServerID,
 		run: func(_ context.Context, path string, environment []string) error {
 			if got := hookEnvValue(environment, cmxsafeUsernameEnv); got != "identity-user" {
 				t.Fatalf("username environment = %q", got)
+			}
+			if got := hookEnvValue(environment, cmxsafeServerIDEnv); got != testServerID {
+				t.Fatalf("server ID environment = %q", got)
 			}
 			sessionID := hookEnvValue(environment, cmxsafeSessionIDEnv)
 			if _, err := hex.DecodeString(sessionID); err != nil || len(sessionID) != cmxsafeSessionIDLen*2 {
@@ -70,6 +77,7 @@ func TestCMXsafeSessionStartFailureIsClosedAndRunsEndOnce(t *testing.T) {
 		endPath:   "/hooks/end",
 		timeout:   time.Second,
 		random:    bytes.NewReader(bytes.Repeat([]byte{1}, cmxsafeSessionIDLen)),
+		serverID:  testServerID,
 		run: func(_ context.Context, path string, _ []string) error {
 			switch path {
 			case "/hooks/start":
@@ -104,6 +112,7 @@ func TestCMXsafeSessionStartTimeoutIsClosed(t *testing.T) {
 		endPath:   "/hooks/end",
 		timeout:   10 * time.Millisecond,
 		random:    bytes.NewReader(bytes.Repeat([]byte{2}, cmxsafeSessionIDLen)),
+		serverID:  testServerID,
 		run: func(ctx context.Context, path string, _ []string) error {
 			if path == "/hooks/end" {
 				endCalls++
@@ -129,7 +138,10 @@ func TestCMXsafeSessionStartTimeoutIsClosed(t *testing.T) {
 func TestCMXsafeSessionIDsAreUnique(t *testing.T) {
 	var mutex sync.Mutex
 	ids := make(map[string]bool)
-	hooks := newCMXsafeSessionHooks("/hooks/start", "", time.Second)
+	hooks, err := newCMXsafeSessionHooks("/hooks/start", "", time.Second)
+	if err != nil {
+		t.Fatalf("new hooks: %v", err)
+	}
 	hooks.run = func(_ context.Context, _ string, environment []string) error {
 		mutex.Lock()
 		defer mutex.Unlock()
@@ -155,9 +167,10 @@ func TestCMXsafeSessionEndTimeoutRunsOnceAndDoesNotReplaceConversationResult(t *
 	var endCalls int
 	conversationError := errors.New("conversation ended")
 	hooks := &cmxsafeSessionHooks{
-		endPath: "/hooks/end",
-		timeout: 10 * time.Millisecond,
-		random:  bytes.NewReader(bytes.Repeat([]byte{3}, cmxsafeSessionIDLen)),
+		endPath:  "/hooks/end",
+		timeout:  10 * time.Millisecond,
+		random:   bytes.NewReader(bytes.Repeat([]byte{3}, cmxsafeSessionIDLen)),
+		serverID: testServerID,
 		run: func(ctx context.Context, _ string, _ []string) error {
 			endCalls++
 			<-ctx.Done()
@@ -183,9 +196,10 @@ func TestCMXsafeSessionEndTimeoutRunsOnceAndDoesNotReplaceConversationResult(t *
 func TestCMXsafeSessionFinishIsIdempotent(t *testing.T) {
 	var endCalls int
 	hooks := &cmxsafeSessionHooks{
-		endPath: "/hooks/end",
-		timeout: time.Second,
-		random:  bytes.NewReader(bytes.Repeat([]byte{4}, cmxsafeSessionIDLen)),
+		endPath:  "/hooks/end",
+		timeout:  time.Second,
+		random:   bytes.NewReader(bytes.Repeat([]byte{4}, cmxsafeSessionIDLen)),
+		serverID: testServerID,
 		run: func(_ context.Context, _ string, _ []string) error {
 			endCalls++
 			return nil
@@ -203,6 +217,85 @@ func TestCMXsafeSessionFinishIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCMXsafeServerIDIsStableAcrossSessionsAndUniqueAcrossInstances(t *testing.T) {
+	instanceAEntropy := make([]byte, 0, cmxsafeSessionIDLen*3)
+	instanceAEntropy = append(instanceAEntropy, bytes.Repeat([]byte{0x10}, cmxsafeSessionIDLen)...)
+	instanceAEntropy = append(instanceAEntropy, bytes.Repeat([]byte{0x11}, cmxsafeSessionIDLen)...)
+	instanceAEntropy = append(instanceAEntropy, bytes.Repeat([]byte{0x12}, cmxsafeSessionIDLen)...)
+	hooksA, err := newCMXsafeSessionHooksWithRandom(
+		"/hooks/start", "", time.Second, bytes.NewReader(instanceAEntropy),
+	)
+	if err != nil {
+		t.Fatalf("new instance A: %v", err)
+	}
+	var serverIDs, sessionIDs []string
+	hooksA.run = func(_ context.Context, _ string, environment []string) error {
+		serverIDs = append(serverIDs, hookEnvValue(environment, cmxsafeServerIDEnv))
+		sessionIDs = append(sessionIDs, hookEnvValue(environment, cmxsafeSessionIDEnv))
+		return nil
+	}
+	for i := 0; i < 2; i++ {
+		if err := hooksA.runConversation(context.Background(), "identity-user", func() error { return nil }); err != nil {
+			t.Fatalf("instance A session %d: %v", i, err)
+		}
+	}
+	if serverIDs[0] != serverIDs[1] || serverIDs[0] != hooksA.serverID {
+		t.Fatalf("server IDs were not stable: %q", serverIDs)
+	}
+	if sessionIDs[0] == sessionIDs[1] {
+		t.Fatalf("session IDs were not unique: %q", sessionIDs)
+	}
+
+	hooksB, err := newCMXsafeSessionHooksWithRandom(
+		"/hooks/start", "", time.Second,
+		bytes.NewReader(bytes.Repeat([]byte{0x20}, cmxsafeSessionIDLen)),
+	)
+	if err != nil {
+		t.Fatalf("new instance B: %v", err)
+	}
+	if hooksA.serverID == hooksB.serverID {
+		t.Fatalf("server IDs match across instances: %q", hooksA.serverID)
+	}
+}
+
+func TestCMXsafeServerIDGenerationFailureIsClosed(t *testing.T) {
+	hooks, err := newCMXsafeSessionHooksWithRandom(
+		"/hooks/start", "", time.Second, iotest.ErrReader(errors.New("entropy unavailable")),
+	)
+	if err == nil || err.Error() != "could not create CMXsafe server identifier" {
+		t.Fatalf("error = %v", err)
+	}
+	if hooks != nil {
+		t.Fatal("hooks returned after server ID generation failure")
+	}
+}
+
+func TestCMXsafeHookEnvironmentReplacesInheritedIdentifiers(t *testing.T) {
+	t.Setenv(cmxsafeUsernameEnv, "inherited-user")
+	t.Setenv(cmxsafeSessionIDEnv, "inherited-session")
+	t.Setenv(cmxsafeServerIDEnv, "inherited-server")
+	environment := sessionHookEnvironment("current-user", "current-session", "current-server")
+
+	for name, want := range map[string]string{
+		cmxsafeUsernameEnv:  "current-user",
+		cmxsafeSessionIDEnv: "current-session",
+		cmxsafeServerIDEnv:  "current-server",
+	} {
+		if got := hookEnvValue(environment, name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+		count := 0
+		for _, entry := range environment {
+			if strings.HasPrefix(entry, name+"=") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("%s entries = %d", name, count)
+		}
+	}
+}
+
 func TestCMXsafeSessionHooksAreOptIn(t *testing.T) {
 	called := false
 	var hooks *cmxsafeSessionHooks
@@ -214,6 +307,12 @@ func TestCMXsafeSessionHooksAreOptIn(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("conversation was not called")
+	}
+	disabledHooks, err := newCMXsafeSessionHooksWithRandom(
+		"", "", time.Second, iotest.ErrReader(errors.New("must not read entropy")),
+	)
+	if err != nil || disabledHooks != nil {
+		t.Fatalf("disabled hooks = %v, error = %v", disabledHooks, err)
 	}
 	if err := validateCMXsafeSessionHookConfiguration("", "/hooks/start", "", time.Second); err == nil {
 		t.Fatal("hook was accepted outside CMXsafe mode")
