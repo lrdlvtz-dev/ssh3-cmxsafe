@@ -796,6 +796,12 @@ var _ = Describe("Testing the ssh3 cli", func() {
 
 			Context("Server behaviour", func() {
 				It("keeps forwards active with -no-session without running a forced command", Label("cmxsafe-policy"), func() {
+					addrs, err := net.InterfaceAddrs()
+					Expect(err).ToNot(HaveOccurred())
+					if !IPv6LoopbackAvailable(addrs) {
+						Skip("IPv6 not available on this host")
+					}
+
 					authorizedPath := fmt.Sprintf("/home/%s/.ssh3/authorized_identities", username)
 					originalAuthorized, err := os.ReadFile(authorizedPath)
 					Expect(err).ToNot(HaveOccurred())
@@ -812,7 +818,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					authorizedLine := fmt.Sprintf("command=\"%s\",no-pty %s", forcedCommand, strings.TrimSpace(string(publicKey)))
 					Expect(os.WriteFile(authorizedPath, []byte(authorizedLine+"\n"), 0600)).To(Succeed())
 
-					origin, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+					origin, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("::1"), Port: 0})
 					Expect(err).ToNot(HaveOccurred())
 					defer origin.Close()
 					originPort := origin.Addr().(*net.TCPAddr).Port
@@ -829,7 +835,7 @@ var _ = Describe("Testing the ssh3 cli", func() {
 					Expect(err).ToNot(HaveOccurred())
 					clientPort := probe.Addr().(*net.TCPAddr).Port
 					Expect(probe.Close()).To(Succeed())
-					forwardSpec := fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", clientPort, originPort)
+					forwardSpec := fmt.Sprintf("%d/127.0.0.1@%d/::1", clientPort, originPort)
 					clientArgs := getClientArgs(rsaPrivKeyPath, "-no-session", "-forward-tcp", forwardSpec)
 					command := exec.Command(ssh3Path, clientArgs...)
 					session, err := Start(command, GinkgoWriter, GinkgoWriter)
