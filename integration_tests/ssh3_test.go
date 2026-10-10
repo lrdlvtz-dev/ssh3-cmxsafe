@@ -795,6 +795,64 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			})
 
 			Context("Server behaviour", func() {
+				It("keeps forwards active with -no-session without running a forced command", Label("cmxsafe-policy"), func() {
+					authorizedPath := fmt.Sprintf("/home/%s/.ssh3/authorized_identities", username)
+					originalAuthorized, err := os.ReadFile(authorizedPath)
+					Expect(err).ToNot(HaveOccurred())
+					DeferCleanup(func() {
+						Expect(os.WriteFile(authorizedPath, originalAuthorized, 0600)).To(Succeed())
+					})
+
+					markerPath := fmt.Sprintf("/tmp/ssh3-no-session-force-command-%d", os.Getpid())
+					_ = os.Remove(markerPath)
+					DeferCleanup(func() { _ = os.Remove(markerPath) })
+					publicKey, err := os.ReadFile(rsaPrivKeyPath + ".pub")
+					Expect(err).ToNot(HaveOccurred())
+					forcedCommand := fmt.Sprintf("touch %s", markerPath)
+					authorizedLine := fmt.Sprintf("command=\"%s\",no-pty %s", forcedCommand, strings.TrimSpace(string(publicKey)))
+					Expect(os.WriteFile(authorizedPath, []byte(authorizedLine+"\n"), 0600)).To(Succeed())
+
+					origin, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+					Expect(err).ToNot(HaveOccurred())
+					defer origin.Close()
+					originPort := origin.Addr().(*net.TCPAddr).Port
+					go func() {
+						defer GinkgoRecover()
+						conn, err := origin.Accept()
+						Expect(err).ToNot(HaveOccurred())
+						defer conn.Close()
+						_, err = conn.Write([]byte("NO_SESSION_OK"))
+						Expect(err).ToNot(HaveOccurred())
+					}()
+
+					probe, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+					Expect(err).ToNot(HaveOccurred())
+					clientPort := probe.Addr().(*net.TCPAddr).Port
+					Expect(probe.Close()).To(Succeed())
+					forwardSpec := fmt.Sprintf("%d/127.0.0.1@%d/127.0.0.1", clientPort, originPort)
+					clientArgs := getClientArgs(rsaPrivKeyPath, "-no-session", "-forward-tcp", forwardSpec)
+					command := exec.Command(ssh3Path, clientArgs...)
+					session, err := Start(command, GinkgoWriter, GinkgoWriter)
+					Expect(err).ToNot(HaveOccurred())
+					defer session.Terminate()
+
+					var conn net.Conn
+					Eventually(func() error {
+						conn, err = net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", clientPort))
+						return err
+					}, "5s").ShouldNot(HaveOccurred())
+					defer conn.Close()
+					payload, err := io.ReadAll(conn)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(string(payload)).To(Equal("NO_SESSION_OK"))
+					Consistently(session, "250ms").ShouldNot(Exit())
+					_, err = os.Stat(markerPath)
+					Expect(os.IsNotExist(err)).To(BeTrue())
+
+					session.Terminate()
+					Eventually(session, "5s").Should(Exit(0))
+				})
+
 				It("Should run a forced command as the authenticated Unix user", Label("cmxsafe-policy"), func() {
 					authorizedPath := fmt.Sprintf("/home/%s/.ssh3/authorized_identities", username)
 					originalAuthorized, err := os.ReadFile(authorizedPath)

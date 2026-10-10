@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/signal"
 	osuser "os/user"
 	"path"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/francoismichel/ssh3"
@@ -537,6 +539,7 @@ func ClientMain() int {
 	displayVersion := flag.Bool("version", false, "if set, displays the software version on standard output and exit")
 	noPKCE := flag.Bool("no-pkce", false, "if set perform PKCE challenge-response with oidc")
 	forwardSSHAgent := flag.Bool("forward-agent", false, "if set, forwards ssh agent to be used with sshv2 connections on the remote host")
+	noSession := flag.Bool("no-session", false, "do not open a remote session; keep configured forwards active until the connection closes or a signal is received (OpenSSH -N equivalent)")
 	var forwardUDPSpecs stringList
 	flag.Var(&forwardUDPSpecs, "forward-udp", "if set, forward a UDP socket. Syntax: <local_bind_port>/<local_bind_ip>@<remote_port>/<remote_ip>. The client opens a UDP socket on local_bind_ip:local_bind_port and relays datagrams over the QUIC tunnel to the server, which sends them to remote_ip:remote_port. May be specified multiple times; a single value may also carry several comma-separated specs (used for UDP multicast groups).")
 	var forwardTCPSpecs stringList
@@ -628,6 +631,10 @@ func ClientMain() int {
 		urlFromParam = fmt.Sprintf("https://%s", urlFromParam)
 	}
 	command := args[1:]
+	if err := validateNoSessionOptions(*noSession, *forwardSSHAgent, command); err != nil {
+		log.Error().Msg(err.Error())
+		return -1
+	}
 
 	// Parse every -forward-tcp/-forward-udp/-reverse-tcp/-reverse-udp spec up
 	// front so that a typo aborts startup before we open any sockets or dial
@@ -864,6 +871,7 @@ func ClientMain() int {
 		log.Error().Msgf("could not dial %s: %s", options.CanonicalHostFormat(), err)
 		return -1
 	}
+	defer c.Close()
 	for _, pair := range forwardTCPPairs {
 		if _, err := c.ForwardTCP(ctx, pair.clientLocal, pair.serverRemote); err != nil {
 			log.Error().Msgf("could not forward TCP %s: %s", pair.source, err)
@@ -925,6 +933,16 @@ func ClientMain() int {
 			log.Error().Msgf("%s", firstErr)
 			return -1
 		}
+	}
+
+	if *noSession {
+		shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		if err := waitWithoutSession(c.Context(), shutdownCtx); err != nil {
+			log.Error().Msgf("forwarding-only connection ended: %s", err)
+			return -1
+		}
+		return 0
 	}
 
 	err = c.RunSession(tty, *forwardSSHAgent, command...)

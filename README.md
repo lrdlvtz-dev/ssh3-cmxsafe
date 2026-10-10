@@ -357,6 +357,8 @@ Usage of ssh3:
         if set, do classical password authentication
   -forward-agent
         if set, forwards ssh agent to be used with sshv2 connections on the remote host
+  -no-session
+        do not open a remote session; keep configured forwards active until the connection closes or a signal is received (OpenSSH -N equivalent)
   -forward-tcp string
         if set, take a localport/remoteip@remoteport forwarding localhost@localport towards remoteip@remoteport
   -forward-udp string
@@ -395,6 +397,23 @@ While discouraged, you can connect to your server using passwords (if explicitly
 with the following command:
 
       ssh3 -use-password username@my-server.example.org/my-secret-path
+
+#### Forwarding without a remote session
+
+Use `-no-session` (the SSH3 equivalent of OpenSSH's `-N`) when the connection
+exists only to carry direct or reverse forwards. The client establishes every
+configured forward and then remains active until it receives `SIGINT`,
+`SIGTERM`, or `SIGHUP`, or until the SSH3 connection closes. It does not open a
+session channel, request a shell, execute a remote command, or trigger a forced
+command configured for session channels.
+
+For example, keep a reverse TCP forward active without starting a remote shell:
+
+      ssh3 -no-session -reverse-tcp 9000/127.0.0.1@9000/:: \
+        username@my-server.example.org/my-secret-path
+
+`-no-session` cannot be combined with a remote command or `-forward-agent`.
+Without this flag, the existing shell/command behavior is unchanged.
 
 #### Config-based session establishment
 `ssh3` parses your OpenSSH config. Currently, it only handles the `Hostname`; `User`, `Port` and `IdentityFile` OpenSSH options.
