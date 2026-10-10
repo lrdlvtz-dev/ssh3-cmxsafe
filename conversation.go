@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/francoismichel/ssh3/util"
@@ -47,6 +48,7 @@ type Conversation struct {
 	conversationID            ConversationID // generated using TLS exporters
 	peerVersion               Version
 	authorizationPolicy       AuthorizationPolicy
+	closeOnce                 sync.Once
 
 	channelsAcceptQueue *util.AcceptQueue[Channel]
 }
@@ -327,6 +329,12 @@ func NewServerConversation(ctx context.Context, controlStream conversationStream
 		return nil, err
 	}
 	backgroundContext, backgroundCancelFunc := context.WithCancelCause(ctx)
+	stopConnectionCancel := context.AfterFunc(qconn.Context(), func() {
+		backgroundCancelFunc(context.Cause(qconn.Context()))
+	})
+	context.AfterFunc(backgroundContext, func() {
+		stopConnectionCancel()
+	})
 
 	conv := &Conversation{
 		controlStream:       controlStream,
@@ -521,8 +529,15 @@ func (c *Conversation) AddDatagram(ctx context.Context, datagram []byte) error {
 }
 
 func (c *Conversation) Close() {
-	c.controlStream.Close()
-	c.cancelContext(nil)
+	c.closeOnce.Do(func() {
+		// Cancel first so conversation-scoped resources (in particular reverse
+		// listeners blocked in Accept) are released without waiting for the
+		// control stream close to complete.
+		c.cancelContext(nil)
+		if c.controlStream != nil {
+			_ = c.controlStream.Close()
+		}
+	})
 }
 
 func (c *Conversation) Context() context.Context {

@@ -795,6 +795,50 @@ var _ = Describe("Testing the ssh3 cli", func() {
 			})
 
 			Context("Server behaviour", func() {
+				It("keeps forwards active with -no-session without running a forced command", Label("cmxsafe-policy"), func() {
+					authorizedPath := fmt.Sprintf("/home/%s/.ssh3/authorized_identities", username)
+					originalAuthorized, err := os.ReadFile(authorizedPath)
+					Expect(err).ToNot(HaveOccurred())
+					DeferCleanup(func() {
+						Expect(os.WriteFile(authorizedPath, originalAuthorized, 0600)).To(Succeed())
+					})
+
+					markerPath := fmt.Sprintf("/tmp/ssh3-no-session-force-command-%d", os.Getpid())
+					_ = os.Remove(markerPath)
+					DeferCleanup(func() { _ = os.Remove(markerPath) })
+					publicKey, err := os.ReadFile(rsaPrivKeyPath + ".pub")
+					Expect(err).ToNot(HaveOccurred())
+					forcedCommand := fmt.Sprintf("touch %s", markerPath)
+					authorizedLine := fmt.Sprintf("command=\"%s\",no-pty %s", forcedCommand, strings.TrimSpace(string(publicKey)))
+					Expect(os.WriteFile(authorizedPath, []byte(authorizedLine+"\n"), 0600)).To(Succeed())
+
+					probe, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+					Expect(err).ToNot(HaveOccurred())
+					clientPort := probe.Addr().(*net.TCPAddr).Port
+					Expect(probe.Close()).To(Succeed())
+					forwardSpec := fmt.Sprintf("%d/127.0.0.1@443/2001:db8::1", clientPort)
+					clientArgs := getClientArgs(rsaPrivKeyPath, "-no-session", "-forward-tcp", forwardSpec)
+					command := exec.Command(ssh3Path, clientArgs...)
+					session, err := Start(command, GinkgoWriter, GinkgoWriter)
+					Expect(err).ToNot(HaveOccurred())
+					defer session.Terminate()
+
+					Eventually(func() error {
+						listener, listenErr := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: clientPort})
+						if listenErr == nil {
+							_ = listener.Close()
+							return fmt.Errorf("forward listener is not active")
+						}
+						return nil
+					}, "5s").Should(Succeed())
+					Consistently(session, "250ms").ShouldNot(Exit())
+					_, err = os.Stat(markerPath)
+					Expect(os.IsNotExist(err)).To(BeTrue())
+
+					session.Terminate()
+					Eventually(session, "5s").Should(Exit(0))
+				})
+
 				It("Should run a forced command as the authenticated Unix user", Label("cmxsafe-policy"), func() {
 					authorizedPath := fmt.Sprintf("/home/%s/.ssh3/authorized_identities", username)
 					originalAuthorized, err := os.ReadFile(authorizedPath)

@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -686,6 +687,41 @@ func writeReverseSetupAck(channel ssh3.Channel, status byte, reason string) erro
 	return nil
 }
 
+type reverseTCPListener interface {
+	AcceptTCP() (*net.TCPConn, error)
+	Close() error
+}
+
+// serveTCPReverseListener owns listener for exactly the lifetime of ctx (or
+// until the accept loop fails). Closing is guarded because context
+// cancellation and an accept failure can happen concurrently.
+func serveTCPReverseListener(ctx context.Context, localAddr *net.TCPAddr, listener reverseTCPListener, handleConn func(*net.TCPConn) error) {
+	var closeOnce sync.Once
+	closeListener := func() {
+		closeOnce.Do(func() { _ = listener.Close() })
+	}
+	stopContextClose := context.AfterFunc(ctx, closeListener)
+	defer func() {
+		stopContextClose()
+		closeListener()
+	}()
+
+	for {
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				log.Error().Msgf("could not accept on TCP listener %s: %s", localAddr, err)
+			}
+			return
+		}
+		if err := handleConn(conn); err != nil {
+			conn.Close()
+			log.Error().Msgf("could not handle connection on reverse TCP listener %s: %s", localAddr, err)
+			return
+		}
+	}
+}
+
 // Copied from client.go ForwardTCP()
 func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User, conv *ssh3.Conversation, channel *ssh3.TCPReverseForwardingChannelImpl) error {
 	if !conv.AuthorizationPolicy().CanListen(channel.LocalAddr.IP, channel.LocalAddr.Port) {
@@ -720,28 +756,20 @@ func handleTCPReverseForwardingChannel(ctx context.Context, user *unix_util.User
 		return ackErr
 	}
 
-	go func() {
-		for {
-			conn, err := conn.AcceptTCP()
-			if err != nil {
-				log.Error().Msgf("could not accept on TCP listener %s: %s", channel.LocalAddr, err)
-				return
-			}
-
-			peer, ok := conn.RemoteAddr().(*net.TCPAddr)
-			if !ok || peer.IP.To4() != nil || peer.IP.To16() == nil || peer.Port == 0 {
-				conn.Close()
-				log.Error().Msgf("CMXsafe reverse TCP requires an observed IPv6 peer tuple, got %v", conn.RemoteAddr())
-				continue
-			}
-			forwardingChannel, err := conv.OpenTCPReverseForwardingChannel(30000, 10, channel.LocalAddr, peer)
-			if err != nil {
-				log.Error().Msgf("could not open new TCP reverse forwarding channel: %s", err)
-				return
-			}
-			forwardReverseTCPInBackground(ctx, forwardingChannel, conn)
+	go serveTCPReverseListener(ctx, channel.LocalAddr, conn, func(conn *net.TCPConn) error {
+		peer, ok := conn.RemoteAddr().(*net.TCPAddr)
+		if !ok || peer.IP.To4() != nil || peer.IP.To16() == nil || peer.Port == 0 {
+			conn.Close()
+			log.Error().Msgf("CMXsafe reverse TCP requires an observed IPv6 peer tuple, got %v", conn.RemoteAddr())
+			return nil
 		}
-	}()
+		forwardingChannel, err := conv.OpenTCPReverseForwardingChannel(30000, 10, channel.LocalAddr, peer)
+		if err != nil {
+			return fmt.Errorf("open new TCP reverse forwarding channel: %w", err)
+		}
+		forwardReverseTCPInBackground(ctx, forwardingChannel, conn)
+		return nil
+	})
 	return nil
 }
 
