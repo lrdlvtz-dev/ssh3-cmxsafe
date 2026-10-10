@@ -310,6 +310,34 @@ apply to TCP and UDP. A forced command receives the requested command only in
 `SSH_ORIGINAL_COMMAND` and runs with the authenticated user's UID, primary GID,
 and supplementary groups.
 
+#### CMXsafe session lifecycle hooks
+
+Strict CMXsafe gateway mode can optionally invoke external lifecycle hooks:
+
+```bash
+ssh3-server \
+  -cmxsafe-gateway-name gateway.example \
+  -cmxsafe-session-start-hook /usr/libexec/cmxsafe-session-start \
+  -cmxsafe-session-end-hook /usr/libexec/cmxsafe-session-end \
+  -cmxsafe-session-hook-timeout 5s \
+  -cert /run/cmxsafe/active.pem -key /run/cmxsafe/active.key
+```
+
+The start hook runs synchronously after authentication and policy loading but
+before the server accepts any channel. A failure or timeout rejects the
+conversation. The end hook runs exactly once when the conversation handler
+returns, including after a failed start, so it can remove a partial allocation.
+Its failure is logged without command output or hook environment values and
+does not replace the conversation result.
+
+Hooks are executed directly, without a shell or interpolated arguments. Both
+receive `CMXSAFE_USERNAME` and the same `CMXSAFE_SESSION_ID` in their
+environment. The session ID is 32 cryptographically random bytes encoded as
+lowercase hexadecimal and is suitable as an opaque lease identifier. Hook
+paths must be absolute. These flags are rejected unless
+`-cmxsafe-gateway-name` enables strict CMXsafe mode; when they are omitted,
+server behavior is unchanged.
+
 ### Using the SSH3 client
 Once you have an SSH3 server running, you can connect to it using the SSH3 client similarly to what
 you did with your classical SSHv2 tool.
