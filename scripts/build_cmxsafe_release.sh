@@ -54,6 +54,9 @@ for arch in amd64 arm64; do
         CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
             go build -trimpath -buildvcs=true -tags disable_password_auth \
             -ldflags='-buildid= -s -w' -o "$stage/ssh3-server" ./cmd/ssh3-server
+        CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+            go build -trimpath -buildvcs=true -tags disable_password_auth \
+            -ldflags='-buildid= -s -w' -o "$stage/ssh3-cmxsafe-cert" ./cmd/ssh3-cmxsafe-cert
     )
 
     install -m 0644 "$repo_root/README.md" "$stage/README.md"
@@ -99,6 +102,7 @@ jq -n \
       capabilities: [
         "cmxsafe-direct-gateway-trust-v1",
         "cmxsafe-active-next-certificate-rotation",
+        "cmxsafe-long-lived-gateway-certificate-v1",
         "cmxsafe-authorized-identity-restrictions-v1",
         "cmxsafe-uid-helper-protocol-v2",
         "tcp-forwarding",
