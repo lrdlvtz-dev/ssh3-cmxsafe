@@ -966,6 +966,9 @@ func ServerMain() int {
 	certPath := flag.String("cert", "./cert.pem", "the filename of the server certificate (or fullchain)")
 	keyPath := flag.String("key", "./priv.key", "the filename of the certificate private key")
 	cmxsafeGatewayName := flag.String("cmxsafe-gateway-name", "", "logical CMXsafe gateway name; enables strict direct-trust TLS mode")
+	cmxsafeSessionStartHook := flag.String("cmxsafe-session-start-hook", "", "absolute executable path invoked after CMXsafe authentication and before accepting channels")
+	cmxsafeSessionEndHook := flag.String("cmxsafe-session-end-hook", "", "absolute executable path invoked once when a CMXsafe conversation ends")
+	cmxsafeSessionHookTimeout := flag.Duration("cmxsafe-session-hook-timeout", 5*time.Second, "maximum runtime for each CMXsafe session hook")
 	var autogenCertificates autogenCertificates
 	flag.Var(&autogenCertificates, "generate-public-cert", "Automatically produce and use a valid public certificate using"+
 		"Let's Encrypt for the provided domain name. The flag can be used several times to generate several certificates."+
@@ -977,6 +980,10 @@ func ServerMain() int {
 		flag.BoolVar(&enablePasswordLogin, "enable-password-login", false, "if set, enable password authentication (disabled by default)")
 	}
 	flag.Parse()
+	if err := validateCMXsafeSessionHookConfiguration(*cmxsafeGatewayName, *cmxsafeSessionStartHook, *cmxsafeSessionEndHook, *cmxsafeSessionHookTimeout); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return -1
+	}
 	if *cmxsafeGatewayName != "" && (*generateSelfSignedCert || len(autogenCertificates) != 0) {
 		fmt.Fprintln(os.Stderr, "CMXsafe gateway mode requires an explicitly provisioned -cert/-key pair and cannot generate certificates")
 		return -1
@@ -1133,6 +1140,7 @@ func ServerMain() int {
 	}
 
 	mux := http.NewServeMux()
+	sessionHooks := newCMXsafeSessionHooks(*cmxsafeSessionStartHook, *cmxsafeSessionEndHook, *cmxsafeSessionHookTimeout)
 	ssh3Server := ssh3.NewServer(30000, 10, &server, func(authenticatedUsername string, conv *ssh3.Conversation) error {
 		authenticatedUser, err := unix_util.GetUser(authenticatedUsername)
 		if err != nil {
@@ -1142,6 +1150,11 @@ func ServerMain() int {
 		if !authorizationPolicy.Initialized {
 			return fmt.Errorf("authenticated conversation has no authorization policy")
 		}
+		finishSessionHooks, err := sessionHooks.begin(conv.Context(), authenticatedUsername)
+		if err != nil {
+			return err
+		}
+		defer finishSessionHooks()
 		for {
 			channel, err := conv.AcceptChannel(conv.Context())
 			if err != nil {
