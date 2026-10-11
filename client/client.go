@@ -226,11 +226,36 @@ func forwardTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net
 	}()
 }
 
-func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, conn *net.TCPConn, cleanup func()) {
+type reverseTCPChannel interface {
+	ChannelID() util.ChannelID
+	NextMessage() (ssh3Messages.Message, error)
+	CancelRead()
+	Close()
+	MaxPacketSize() uint64
+	WriteData([]byte, ssh3Messages.SSHDataType) (int, error)
+}
+
+func forwardReverseTCPInBackground(ctx context.Context, channel reverseTCPChannel, conn *net.TCPConn, cleanup func()) {
 	var cleanupOnce sync.Once
-	done := func() { cleanupOnce.Do(func() { conn.Close(); cleanup() }) }
+	finished := make(chan struct{})
+	finish := func(abort bool) {
+		cleanupOnce.Do(func() {
+			// Closing the channel is only needed to abort an in-flight pump.  On
+			// an orderly half-close, each direction must remain alive until the
+			// opposite direction has drained its response.
+			if abort {
+				channel.CancelRead()
+				channel.Close()
+			}
+			conn.Close()
+			cleanup()
+			close(finished)
+		})
+	}
+	var pumps sync.WaitGroup
+	pumps.Add(2)
 	go func() {
-		defer done()
+		defer pumps.Done()
 		defer conn.CloseWrite()
 		for {
 			select {
@@ -243,6 +268,7 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 				log.Info().Msgf("eof on tcp-forwarding channel %d", channel.ChannelID())
 			} else if err != nil {
 				log.Error().Msgf("could get message from tcp forwarding channel: %s", err)
+				finish(true)
 				return
 			}
 
@@ -259,6 +285,7 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 						log.Error().Msgf("could not write data on TCP socket: %s", err)
 						// signal the write error to the peer
 						channel.CancelRead()
+						finish(true)
 						return
 					}
 				} else {
@@ -271,7 +298,7 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 	}()
 
 	go func() {
-		defer done()
+		defer pumps.Done()
 		defer channel.Close()
 		defer conn.CloseRead()
 		buf := make([]byte, channel.MaxPacketSize())
@@ -283,7 +310,10 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 			}
 			n, err := conn.Read(buf)
 			if err != nil && err != io.EOF {
-				log.Error().Msgf("could read data on TCP socket: %s", err)
+				if !errors.Is(err, net.ErrClosed) {
+					log.Error().Msgf("could read data on TCP socket: %s", err)
+				}
+				finish(true)
 				return
 			}
 			//log.Debug().Msgf("Reading from socket: %s", string(buf))
@@ -299,6 +329,7 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 				default:
 					log.Error().Msgf("could send data on channel: %s", errWrite)
 				}
+				finish(true)
 				return
 			}
 			if err == io.EOF {
@@ -306,6 +337,20 @@ func forwardReverseTCPInBackground(ctx context.Context, channel ssh3.Channel, co
 			}
 		}
 	}()
+
+	go func() {
+		pumps.Wait()
+		finish(false)
+	}()
+	if ctx.Done() != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				finish(true)
+			case <-finished:
+			}
+		}()
+	}
 }
 
 func forwardReverseUDPInBackground(ctx context.Context, channel ssh3.Channel, conn *net.UDPConn, cleanup func()) {

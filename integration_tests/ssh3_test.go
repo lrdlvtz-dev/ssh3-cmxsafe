@@ -341,21 +341,21 @@ var _ = Describe("Testing the ssh3 cli", func() {
 							Expect(err).ToNot(HaveOccurred())
 							defer conn.Close()
 
-							// Read message from client
+							// Read the complete request and wait for its half-close before
+							// responding. This catches regressions where one finished pump
+							// tears down the opposite direction before it can drain.
 							buffer := make([]byte, len(messageFromClient))
-							_, err = conn.Read(buffer)
+							_, err = io.ReadFull(conn, buffer)
 							Expect(err).ToNot(HaveOccurred())
 							Expect(string(buffer)).To(Equal(messageFromClient))
+							n, err := conn.Read(buffer)
+							Expect(err).To(Equal(io.EOF))
+							Expect(n).To(Equal(0))
 
 							// Send message to client
 							_, err = conn.Write([]byte(messageFromServer))
 							Expect(err).ToNot(HaveOccurred())
 							conn.(*net.TCPConn).CloseWrite()
-
-							// Read from the client after receiving the message, assert EOF
-							n, err := conn.Read(buffer)
-							Expect(err).To(Equal(io.EOF))
-							Expect(n).To(Equal(0))
 						}()
 
 						Eventually(serverStarted).Should(Receive())
