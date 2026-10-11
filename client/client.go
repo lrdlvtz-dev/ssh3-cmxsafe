@@ -533,7 +533,7 @@ func (d *reverseDispatcher) dispatch(channel ssh3.Channel) {
 			channel.Close()
 			return
 		}
-		conn, release, err := dialMirrorTCP(channel, c.PeerAddr, h.clientTarget)
+		conn, release, err := dialMirrorTCP(h.ctx, channel, c.PeerAddr, h.clientTarget)
 		if err != nil {
 			log.Error().Msgf("reverse TCP: could not create mirror socket to %s: %s", h.clientTarget, err)
 			channel.Close()
