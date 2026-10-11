@@ -8,16 +8,27 @@ package client
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
+	"syscall"
 	"time"
+
+	"github.com/rs/zerolog/log"
+	"golang.org/x/sys/unix"
 )
 
 const defaultEndpointdSocket = "/run/cmxsafe/endpointd.sock"
+
+const (
+	mirrorTCPBindRetryDelay = 10 * time.Millisecond
+	mirrorTCPDialTimeout    = 1100 * time.Millisecond
+)
 
 type endpointdReply struct {
 	OK    bool   `json:"ok"`
@@ -83,7 +94,48 @@ func endpointdPeer(op string, leaseID uint64, ip net.IP) error {
 	return nil
 }
 
-func dialMirrorTCP(channel ssh3Channel, peer, target *net.TCPAddr) (*net.TCPConn, func(), error) {
+func dialReusableMirrorTCP(ctx context.Context, peer, target *net.TCPAddr) (*net.TCPConn, error) {
+	if ctx == nil {
+		return nil, errors.New("mirror TCP dial requires a context")
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, mirrorTCPDialTimeout)
+	defer cancel()
+	dialer := net.Dialer{
+		LocalAddr: peer,
+		Control: func(_, _ string, raw syscall.RawConn) error {
+			var socketErr error
+			if err := raw.Control(func(fd uintptr) {
+				socketErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+			}); err != nil {
+				return err
+			}
+			return socketErr
+		},
+	}
+	for {
+		conn, err := dialer.DialContext(dialCtx, "tcp6", target.String())
+		if err == nil {
+			tcpConn, ok := conn.(*net.TCPConn)
+			if !ok {
+				conn.Close()
+				return nil, errors.New("mirror TCP dial returned a non-TCP connection")
+			}
+			return tcpConn, nil
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) && !errors.Is(err, syscall.EADDRNOTAVAIL) {
+			return nil, err
+		}
+		timer := time.NewTimer(mirrorTCPBindRetryDelay)
+		select {
+		case <-dialCtx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("mirror TCP source tuple remained unavailable after %v: %w (last bind error: %v)", mirrorTCPDialTimeout, dialCtx.Err(), err)
+		case <-timer.C:
+		}
+	}
+}
+
+func dialMirrorTCP(ctx context.Context, channel ssh3Channel, peer, target *net.TCPAddr) (*net.TCPConn, func(), error) {
 	if peer == nil || peer.Zone != "" || target == nil {
 		return nil, nil, errors.New("invalid TCP mirror tuple")
 	}
@@ -94,13 +146,31 @@ func dialMirrorTCP(channel ssh3Channel, peer, target *net.TCPAddr) (*net.TCPConn
 	if err := endpointdPeer("ensure", leaseID, peer.IP); err != nil {
 		return nil, nil, err
 	}
-	release := func() { _ = endpointdPeer("release", leaseID, peer.IP) }
-	conn, err := net.DialTCP("tcp6", peer, target)
-	if err != nil {
-		release()
-		return nil, nil, fmt.Errorf("dial TCP mirror socket: %w", err)
+	var releaseOnce sync.Once
+	var releaseErr error
+	releaseLease := func() error {
+		releaseOnce.Do(func() {
+			releaseErr = endpointdPeer("release", leaseID, peer.IP)
+		})
+		return releaseErr
 	}
-	return conn, release, nil
+	conn, err := dialReusableMirrorTCP(ctx, peer, target)
+	if err != nil {
+		dialErr := fmt.Errorf("dial TCP mirror socket: %w", err)
+		if releaseErr := releaseLease(); releaseErr != nil {
+			return nil, nil, errors.Join(dialErr, fmt.Errorf("release mirror TCP endpoint lease: %w", releaseErr))
+		}
+		return nil, nil, dialErr
+	}
+	cleanup := func() {
+		if err := releaseLease(); err != nil {
+			log.Error().Err(err).
+				Uint64("lease_id", leaseID).
+				Str("peer_ipv6", peer.IP.String()).
+				Msg("release mirror TCP endpoint lease")
+		}
+	}
+	return conn, cleanup, nil
 }
 
 func dialMirrorUDP(channel ssh3Channel, peer, target *net.UDPAddr) (*net.UDPConn, func(), error) {
