@@ -328,10 +328,11 @@ func GetConfigForHost(host string, config *ssh_config.Config, pluginsOptionsPars
 func BuildJWTBearerToken(signingMethod jwt.SigningMethod, key interface{}, username string, conversation *Conversation) (string, error) {
 	convID := conversation.ConversationID()
 	b64ConvID := base64.StdEncoding.EncodeToString(convID[:])
+	now := time.Now()
 	token := jwt.NewWithClaims(signingMethod, jwt.MapClaims{
 		"iss":       username,
-		"iat":       jwt.NewNumericDate(time.Now()),
-		"exp":       jwt.NewNumericDate(time.Now().Add(10 * time.Second)),
+		"iat":       jwt.NewNumericDate(now),
+		"exp":       jwt.NewNumericDate(now.Add(10 * time.Second)),
 		"sub":       "ssh3",
 		"aud":       "unused",
 		"client_id": fmt.Sprintf("ssh3-%s", username),

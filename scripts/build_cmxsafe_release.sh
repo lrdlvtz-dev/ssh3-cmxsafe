@@ -104,6 +104,7 @@ jq -n \
         "cmxsafe-active-next-certificate-rotation",
         "cmxsafe-long-lived-gateway-certificate-v1",
         "cmxsafe-authorized-identity-restrictions-v1",
+        "cmxsafe-session-bound-pubkey-auth-v1",
         "cmxsafe-uid-helper-protocol-v2",
         "tcp-forwarding",
         "udp-forwarding"
