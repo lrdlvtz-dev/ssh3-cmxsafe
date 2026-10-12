@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"fmt"
 	"net/http"
+	"time"
 
 	ssh3 "github.com/francoismichel/ssh3"
 	"github.com/francoismichel/ssh3/auth"
@@ -17,6 +18,14 @@ import (
 // impements server-side pubkey-based authentication
 
 const PLUGIN_NAME = "github.com/francoismichel/ssh3-server_pubkey_auth"
+
+// The timestamps remain part of the public-key JWT wire format, but freshness
+// comes from the signed TLS-exporter-derived conversation ID.  Checking iat or
+// exp against the verifier's wall clock would add an NTP-dependent denial of
+// service without preventing replay in another conversation.  Keep a bounded,
+// internally consistent declared interval so malformed tokens still fail
+// closed, while authentication itself remains independent of clock skew.
+const maxPubkeyTokenDeclaredLifetime = 30 * time.Second
 
 func init() {
 	if err := plugins.RegisterServerAuthPlugin(PLUGIN_NAME, PubkeyAuthPlugin); err != nil {
@@ -54,32 +63,59 @@ func (v *PubkeyJWTIdentityVerifier) Verify(request *http.Request, base64Conversa
 			}
 			return nil, fmt.Errorf("unsupported signature algorithm '%s' for %T", unvalidatedToken.Method.Alg(), v)
 		},
-		jwt.WithIssuer(v.username),
-		jwt.WithSubject("ssh3"),
-		jwt.WithIssuedAt(),
-		jwt.WithAudience("unused"),
+		jwt.WithoutClaimsValidation(),
 		jwt.WithValidMethods([]string{"RS256", "EdDSA", "ES256"}))
 	if err != nil || !token.Valid {
 		log.Error().Msgf("invalid private key token: %s", err)
 		return false
 	}
-	if claims, ok := token.Claims.(jwt.MapClaims); ok {
-		if _, ok = claims["exp"]; !ok {
-			return false
-		}
-		if clientId, ok := claims["client_id"]; !ok || clientId != fmt.Sprintf("ssh3-%s", v.username) {
-			return false
-		}
-		if jti, ok := claims["jti"]; !ok || jti != base64ConversationID {
-			log.Error().Msgf("rsa verification failed: the jti claim does not contain the base64-encoded conversation ID")
-			return false
-		}
-	} else {
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
 		log.Error().Msgf("bad JWT claims type: %T", token.Claims)
+		return false
+	}
+	issuer, err := claims.GetIssuer()
+	if err != nil || issuer != v.username {
+		return false
+	}
+	subject, err := claims.GetSubject()
+	if err != nil || subject != "ssh3" {
+		return false
+	}
+	audiences, err := claims.GetAudience()
+	if err != nil || !containsAudience(audiences, "unused") {
+		return false
+	}
+	issuedAt, err := claims.GetIssuedAt()
+	if err != nil || issuedAt == nil {
+		return false
+	}
+	expiresAt, err := claims.GetExpirationTime()
+	if err != nil || expiresAt == nil {
+		return false
+	}
+	declaredLifetime := expiresAt.Time.Sub(issuedAt.Time)
+	if declaredLifetime <= 0 || declaredLifetime > maxPubkeyTokenDeclaredLifetime {
+		return false
+	}
+	if clientID, ok := claims["client_id"]; !ok || clientID != fmt.Sprintf("ssh3-%s", v.username) {
+		return false
+	}
+	if jti, ok := claims["jti"]; !ok || jti != base64ConversationID {
+		log.Error().Msg("public-key verification failed: jti is not bound to this conversation")
 		return false
 	}
 
 	return true
+}
+
+func containsAudience(audiences jwt.ClaimStrings, expected string) bool {
+	for _, audience := range audiences {
+		if audience == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func PubkeyAuthPlugin(username string, identityStr string) (auth.RequestIdentityVerifier, error) {

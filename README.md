@@ -310,6 +310,15 @@ apply to TCP and UDP. A forced command receives the requested command only in
 `SSH_ORIGINAL_COMMAND` and runs with the authenticated user's UID, primary GID,
 and supplementary groups.
 
+CMXsafe public-key authentication binds the signed JWT `jti` claim to the
+conversation identifier derived from the TLS exporter.  The signed `iat` and
+`exp` claims remain present for wire compatibility and must describe a short,
+internally consistent interval, but they are not compared with the server wall
+clock.  A proof captured from one QUIC/TLS connection therefore cannot be
+replayed in another, while loss or manipulation of NTP cannot deny public-key
+authentication.  This exception is limited to public-key identities; OIDC
+tokens retain their normal time-based validation.
+
 #### CMXsafe session lifecycle hooks
 
 Strict CMXsafe gateway mode can optionally invoke external lifecycle hooks:
